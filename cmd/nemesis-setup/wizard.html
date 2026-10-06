@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nemesis setup</title>
+<style>
+:root {
+  --bg: #f4f2f7; --card: #ffffff; --text: #1d1a24; --muted: #625d6e; --line: #dcd7e4;
+  --accent: #6b4fd8; --accent-text: #ffffff; --ok: #1f7a46; --warn: #9a5b00; --bad: #b3261e; --code: #efecf4;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15131b; --card: #1f1c28; --text: #ece9f3; --muted: #a39dae; --line: #34303f;
+    --accent: #8f76ff; --accent-text: #0f0d14; --ok: #5fd28f; --warn: #f0b04a; --bad: #ff7a70; --code: #2a2635;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 "Segoe UI", system-ui, sans-serif; }
+main { max-width: 680px; margin: 40px auto; padding: 0 16px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 28px 30px; }
+h1 { font-size: 24px; margin: 0 0 4px; }
+h2 { font-size: 18px; margin: 0 0 14px; }
+.sub { color: var(--muted); margin: 0 0 22px; }
+.steps { display: flex; gap: 6px; margin-bottom: 18px; }
+.steps span { flex: 1; height: 4px; border-radius: 2px; background: var(--line); }
+.steps span.on { background: var(--accent); }
+ul.det { list-style: none; padding: 0; margin: 0 0 8px; }
+ul.det li { padding: 6px 0; border-bottom: 1px solid var(--line); display: flex; gap: 10px; }
+ul.det li:last-child { border-bottom: 0; }
+.yes { color: var(--ok); font-weight: 600; min-width: 18px; }
+.no { color: var(--muted); min-width: 18px; }
+label.opt { display: flex; gap: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; margin-bottom: 10px; cursor: pointer; }
+label.opt:hover { border-color: var(--accent); }
+label.opt input { margin-top: 4px; accent-color: var(--accent); width: 17px; height: 17px; }
+label.opt b { display: block; }
+label.opt small { color: var(--muted); }
+.tag { font-size: 12px; color: var(--ok); margin-left: 6px; font-weight: 600; }
+.field { margin-bottom: 18px; }
+.field label { display: block; font-weight: 600; margin-bottom: 6px; }
+input[type=text], input[type=password] { width: 100%; padding: 9px 11px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); font: inherit; }
+.row { display: flex; gap: 8px; }
+.row input { flex: 1; }
+.hint { color: var(--muted); font-size: 13px; margin-top: 6px; }
+.nav { display: flex; justify-content: space-between; margin-top: 24px; gap: 10px; }
+button { font: inherit; padding: 9px 20px; border-radius: 9px; border: 1px solid var(--line); background: transparent; color: var(--text); cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+button:disabled { opacity: .5; cursor: default; }
+pre.log { background: var(--code); border-radius: 10px; padding: 12px 14px; font: 12.5px/1.5 Consolas, monospace; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow: auto; margin: 0; }
+.msg { padding: 10px 14px; border-radius: 10px; margin: 0 0 12px; border: 1px solid var(--line); }
+.msg.warn { border-color: var(--warn); }
+.msg.bad { border-color: var(--bad); color: var(--bad); }
+.msg.good { border-color: var(--ok); }
+ol.next li { margin-bottom: 8px; }
+a { color: var(--accent); }
+code { background: var(--code); padding: 1px 5px; border-radius: 5px; font-size: 13px; }
+.hidden { display: none; }
+.foot { color: var(--muted); font-size: 12px; text-align: center; margin-top: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <div class="steps" id="steps"></div>
+    <div id="view">Loading...</div>
+  </div>
+  <div class="foot" id="foot"></div>
+</main>
+<script>
+const TOKEN = "{{TOKEN}}";
+let S = null;        // server state
+let step = 0;
+const choice = { claudeDesktop: false, claudeCode: false, codex: false, geminiCli: false, name: "Kestrel", closeRunning: false };
+const GUIDE = "https://github.com/MrDentalStone/Nemesis/blob/main/docs/GETTING-STARTED.md";
+
+async function call(method, path, body) {
+  const r = await fetch(path, { method, headers: { "X-Nemesis-Token": TOKEN, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const $ = id => document.getElementById(id);
+setInterval(() => call("POST", "/api/ping").catch(() => {}), 5000);
+
+function steps(n, total) {
+  $("steps").innerHTML = Array.from({ length: total }, (_, i) => `<span class="${i <= n ? "on" : ""}"></span>`).join("");
+}
+function render(html) { $("view").innerHTML = html; }
+
+async function boot() {
+  S = await call("GET", "/api/state");
+  const d = S.detect;
+  $("foot").textContent = `Nemesis ${S.version}` + (S.test ? " - TEST MODE (fake folders)" : "");
+  if (S.mode === "uninstall") return uninstallPage();
+  choice.claudeDesktop = d.claudeDesktop;
+  choice.claudeCode = d.claudeCode;
+  choice.codex = false;      // tick-in only: these are rarer and need more setup
+  choice.geminiCli = false;
+  if (d.existing) {
+    const o = d.existing.options;
+    Object.assign(choice, { claudeDesktop: o.claudeDesktop, claudeCode: o.claudeCode, codex: o.codex, geminiCli: o.geminiCli });
+  }
+  if (d.savedName) choice.name = d.savedName;
+  welcome();
+}
+
+function welcome() {
+  step = 0; steps(0, 4);
+  const d = S.detect;
+  const li = (ok, text) => `<li><span class="${ok ? "yes" : "no"}">${ok ? "&#10003;" : "&ndash;"}</span><span>${text}</span></li>`;
+  render(`
+    <h1>Nemesis</h1>
+    <p class="sub">An AI player for Magic: The Gathering Commander in Tabletop Simulator.</p>
+    ${S.payloadOk ? "" : `<div class="msg bad">This build has no payload: it was built without the Nemesis programs inside. Download NemesisSetup.exe from the Releases page.</div>`}
+    ${d.existing ? `<div class="msg good">Nemesis ${esc(d.existing.version)} is already installed. Continuing updates it and keeps your settings.</div>` : ""}
+    <h2>On this PC</h2>
+    <ul class="det">
+      ${li(d.tts, d.tts ? "Tabletop Simulator" : "Tabletop Simulator not found yet (install it from Steam; the pad will be ready for it)")}
+      ${li(d.claudeDesktop, "Claude Desktop")}
+      ${li(d.claudeCode, "Claude Code" + (d.claudeCode && !d.claudeCodeCli ? " (config only, the claude command is not on PATH)" : ""))}
+      ${li(d.codex, "Codex")}
+      ${li(d.geminiCli, "Gemini CLI")}
+    </ul>
+    ${noClient(d) ? `<div class="msg warn">No AI client found on this PC. Nemesis needs one to play: Claude Desktop is free and the easiest start. <a href="${GUIDE}" target="_blank" rel="noopener">The getting-started guide</a> walks you through it; run this setup again afterwards (or tick a client on the next page now).</div>` : ""}
+    <p class="hint">Everything installs for your Windows user only. No admin rights needed.</p>
+    <div class="nav"><span></span><button class="primary" onclick="clients()" ${S.payloadOk ? "" : "disabled"}>Next</button></div>`);
+}
+
+function noClient(d) { return !d.claudeDesktop && !d.claudeCode && !d.codex && !d.geminiCli; }
+
+function clients() {
+  step = 1; steps(1, 4);
+  const d = S.detect;
+  const opt = (k, title, text, found) => `<label class="opt"><input type="checkbox" ${choice[k] ? "checked" : ""} onchange="choice['${k}']=this.checked">
+     <span><b>${title}${found ? '<span class="tag">found</span>' : ""}</b><small>${text}</small></span></label>`;
+  render(`
+    <h2>Which AI client will play?</h2>
+    <p class="sub">Nemesis plugs into the AI app you already use. Pick one or more; you can run setup again later to change this.</p>
+    ${opt("claudeDesktop", "Claude Desktop", "Adds Nemesis to Claude Desktop. Works on the Free plan, with usage limits.", d.claudeDesktop)}
+    ${opt("claudeCode", "Claude Code", "Adds Nemesis to Claude Code for every folder. The smoothest game, with Claude Pro or Max.", d.claudeCode)}
+    ${opt("codex", "Codex", "Adds Nemesis to Codex (ChatGPT Plus or higher) with a long tool timeout.", d.codex)}
+    ${opt("geminiCli", "Gemini CLI", "Adds Nemesis to Gemini CLI (trusted, long timeout).", d.geminiCli)}
+    ${noClient(d) ? `<p class="hint">Not sure? Install <a href="https://claude.ai/download" target="_blank" rel="noopener">Claude Desktop</a> (free), tick it here, and see <a href="${GUIDE}" target="_blank" rel="noopener">the getting-started guide</a>.</p>` : ""}
+    ${d.managedMcp ? `<div class="msg warn">Claude Code on this PC uses an admin-managed server list. Setup will show what to ask your admin to add.</div>` : ""}
+    <div class="nav"><button onclick="welcome()">Back</button><button class="primary" onclick="settings()">Next</button></div>`);
+}
+
+function settings() {
+  step = 2; steps(2, 4);
+  render(`
+    <h2>Settings</h2>
+    <div class="field"><label for="name">The AI's name at the table</label>
+      <input type="text" id="name" value="${esc(choice.name)}" maxlength="24" oninput="choice.name=this.value">
+      <div class="hint">What the other players see in chat. Kestrel by default.</div></div>
+    <div class="nav"><button onclick="clients()">Back</button><button class="primary" id="go" onclick="install()">Install</button></div>`);
+}
+
+async function install() {
+  const any = choice.claudeDesktop || choice.claudeCode || choice.codex || choice.geminiCli;
+  if (!any && !confirm("No AI client is ticked. Install only the programs and the pad?")) return;
+  // programs still running from the install folder would keep the old version
+  try { S = await call("GET", "/api/state"); } catch (e) {}
+  const run = (S && S.detect.running) || [];
+  if (run.length && !choice.closeRunning) return runningPage(run);
+  doInstall();
+}
+
+function runningPage(run) {
+  step = 3; steps(3, 4);
+  const names = run.map(p => `<li><code>${esc(p.path.split("\\").pop())}</code> (PID ${p.pid})</li>`).join("");
+  const mcp = run.some(p => /nemesis-mcp/i.test(p.path));
+  render(`
+    <h2>Nemesis is running</h2>
+    <p>These Nemesis programs are still running from the install folder:</p><ul>${names}</ul>
+    <p>If they keep running they stay on the <b>old version</b>. Setup can close them now.</p>
+    ${mcp ? `<div class="msg warn">Closing <code>nemesis-mcp</code> disconnects Nemesis from your AI client. Afterwards restart Claude Desktop, or reconnect in Claude Code (<code>/mcp</code>).</div>` : ""}
+    <div class="nav"><button onclick="settings()">Back</button>
+      <span><button onclick="choice.closeRunning=false; doInstall()">Continue without closing</button>
+      <button class="primary" onclick="choice.closeRunning=true; doInstall()">Close them and continue</button></span></div>`);
+}
+
+async function doInstall() {
+  step = 3; steps(3, 4);
+  render(`<h2>Installing</h2><pre class="log" id="log"></pre>`);
+  try { await call("POST", "/api/install", choice); } catch (e) { return done({ ok: false, error: e.message }); }
+  follow(done);
+}
+
+async function follow(then) {
+  let next = 0;
+  for (;;) {
+    const p = await call("GET", "/api/progress?since=" + next);
+    if (p.lines && p.lines.length) { const l = $("log"); l.textContent += p.lines.join("\n") + "\n"; l.scrollTop = l.scrollHeight; }
+    next = p.next;
+    if (p.done) return then(p.result || {});
+    await new Promise(r => setTimeout(r, 400));
+  }
+}
+
+function done(res) {
+  steps(4, 4);
+  const log = $("log") ? $("log").textContent : "";
+  const warns = (res.warnings || []).map(w => `<div class="msg ${/^IMPORTANT/.test(w) ? "bad" : "warn"}">${esc(w)}</div>`).join("");
+  if (!res.ok) {
+    render(`<h2>Setup could not finish</h2><div class="msg bad">${esc(res.error || "unknown error")}</div>${warns}
+      <pre class="log">${esc(log)}</pre><div class="nav"><button onclick="settings()">Back</button><button onclick="quit()">Close</button></div>`);
+    return;
+  }
+  const closed = (res.manifest && res.manifest.closed) || [];
+  const closedNote = closed.length ? `<div class="msg warn">Closed ${closed.map(esc).join(", ")} so it could be updated.${closed.some(c => /nemesis-mcp/i.test(c)) ? " Your AI client lost Nemesis: restart Claude Desktop, or reconnect in Claude Code with <code>/mcp</code>." : ""}</div>` : "";
+  const steps2 = [];
+  steps2.push(`Start Tabletop Simulator and load a <a href="https://github.com/MrDentalStone/Nemesis/blob/main/docs/TABLES.md" target="_blank" rel="noopener">supported Commander table</a>.`);
+  if (choice.claudeDesktop) steps2.push(`Claude Desktop: quit it from the tray icon and start it again, then start a chat and say <b>let's play</b>.`);
+  if (choice.claudeCode) steps2.push(`Claude Code: start <code>claude</code> in any folder (or run <code>/mcp</code> and reconnect in a session that is already open) and say <b>let's play</b>.`);
+  if (choice.codex || choice.geminiCli) steps2.push(`Codex / Gemini CLI: start it and say <b>let's play</b>.`);
+  if (!choice.claudeDesktop && !choice.claudeCode && !choice.codex && !choice.geminiCli) steps2.push(`Set up an AI client: <a href="${GUIDE}" target="_blank" rel="noopener">the getting-started guide</a> shows how, then run this setup again and tick it.`);
+  steps2.push(`If the table has no Nemesis pad, the AI offers to place one (say yes), or spawn it yourself from <b>Objects &gt; Saved Objects &gt; Nemesis</b>. Pick the AI's colour with <b>&lt; &gt;</b> on the pad.`);
+  steps2.push(`One AI at a time: only one program can talk to Tabletop Simulator, so do not open Nemesis in two clients at once.`);
+  render(`
+    <h2>Nemesis is installed</h2>
+    ${warns}${closedNote}
+    <ol class="next">${steps2.map(s => `<li>${s}</li>`).join("")}</ol>
+    <details><summary>Details</summary><pre class="log">${esc(log)}</pre></details>
+    <div class="nav"><span></span><button class="primary" onclick="quit()">Close</button></div>`);
+}
+
+async function quit() {
+  try { await call("POST", "/api/quit"); } catch (e) {}
+  render(`<h2>All done</h2><p class="sub">You can close this tab.</p>`);
+  $("steps").innerHTML = "";
+}
+
+function uninstallPage() {
+  const d = S.detect, m = d.existing;
+  $("steps").innerHTML = "";
+  const what = [];
+  if (m) {
+    if (m.options.claudeDesktop) what.push("Nemesis in Claude Desktop");
+    if (m.claudeCodeCli || m.claudeJson) what.push("Nemesis in Claude Code");
+    if (m.codex) what.push("Nemesis in Codex");
+    if (m.geminiCli) what.push("Nemesis in Gemini CLI");
+    if (m.padFile) what.push("the pad in TTS Saved Objects (pads on your tables stay)");
+  }
+  what.push("the Start menu shortcuts and the program folder");
+  render(`
+    <h1>Remove Nemesis</h1>
+    <p class="sub">${m ? "Version " + esc(m.version) + " in " + esc(d.installDir) : "No install record found; setup removes whatever Nemesis entries it finds."}</p>
+    <h2>This removes</h2><ul>${what.map(w => `<li>${w}</li>`).join("")}</ul>
+    ${d.agentEnv ? `<label class="opt"><input type="checkbox" id="delkey"><span><b>Also delete the old Gemini agent's key file</b><small>agent.env. Your own modes and decks in the same folder stay.</small></span></label>` : ""}
+    <div class="nav"><button onclick="quit()">Cancel</button><button class="primary" onclick="uninstall()">Remove</button></div>`);
+}
+
+async function uninstall() {
+  const del = $("delkey") ? $("delkey").checked : false;
+  render(`<h2>Removing</h2><pre class="log" id="log"></pre>`);
+  try { await call("POST", "/api/uninstall", { deleteKey: del }); } catch (e) { return render(`<div class="msg bad">${esc(e.message)}</div>`); }
+  follow(res => {
+    const warns = (res.warnings || []).map(w => `<div class="msg warn">${esc(w)}</div>`).join("");
+    const log = $("log").textContent;
+    render(`<h2>Nemesis is removed</h2>${warns}<pre class="log">${esc(log)}</pre><div class="nav"><span></span><button class="primary" onclick="quit()">Close</button></div>`);
+  });
+}
+
+boot().catch(e => render(`<div class="msg bad">Setup is not responding: ${esc(e.message)}. Run NemesisSetup.exe again.</div>`));
+</script>
+</body>
+</html>

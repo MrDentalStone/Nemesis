@@ -1,0 +1,4 @@
+The installer embeds this folder. `go run ./cmd/nemesis-setup/mksetup` builds
+nemesis-mcp.exe, nemesis-agent.exe and nemesis-cli.exe for Windows into it and
+then builds NemesisSetup.exe. Only this file is checked in; a setup built
+without the programs says so and installs nothing.

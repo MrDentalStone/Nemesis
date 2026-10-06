@@ -1,0 +1,51 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - name: build
+        run: |
+          set -e
+          go run ./cmd/build-mod
+          for target in windows/amd64 darwin/arm64 darwin/amd64 linux/amd64; do
+            os=${target%/*}; arch=${target#*/}; ext=""
+            [ "$os" = windows ] && ext=".exe"
+            dir="nemesis-${GITHUB_REF_NAME}-${os}-${arch}"
+            mkdir -p "$dir"
+            for cmd in nemesis-mcp nemesis-cli; do
+              GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -trimpath \
+                -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "$dir/$cmd$ext" ./cmd/$cmd
+            done
+            cp dist/Nemesis.json README.md LICENSE PLAYBOOK.md RULES.md "$dir/"
+            cp -r docs "$dir/"
+            zip -qr "$dir.zip" "$dir"
+          done
+      - name: Claude Desktop extensions (.mcpb)
+        run: |
+          set -e
+          for target in windows/amd64 darwin/arm64 darwin/amd64; do
+            os=${target%/*}; arch=${target#*/}
+            dir="build/mcpb-${os}-${arch}"
+            go run ./cmd/mcpb -version "$GITHUB_REF_NAME" -os "$os" -arch "$arch" -dir "$dir" -build
+            npx -y @anthropic-ai/mcpb@2.1.2 validate "$dir/manifest.json"
+            npx -y @anthropic-ai/mcpb@2.1.2 pack "$dir" "nemesis-${GITHUB_REF_NAME}-${os}-${arch}.mcpb"
+          done
+      - name: Windows installer (NemesisSetup.exe)
+        run: go run ./cmd/nemesis-setup/mksetup -version "$GITHUB_REF_NAME" -out "NemesisSetup-${GITHUB_REF_NAME}.exe"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            nemesis-*.zip
+            nemesis-*.mcpb
+            NemesisSetup-*.exe
+          generate_release_notes: true

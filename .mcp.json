@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "nemesis": {
+      "command": "bin/nemesis-mcp.exe",
+      "args": []
+    }
+  }
+}

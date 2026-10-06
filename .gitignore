@@ -1,0 +1,8 @@
+bin/
+*.exe
+/nemesis-*.zip
+/dist/*.zip
+/build/
+*.mcpb
+/cmd/nemesis-setup/payload/*
+!/cmd/nemesis-setup/payload/PAYLOAD.txt

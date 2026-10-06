@@ -1,0 +1,31 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
+      - name: generated docs are current
+        run: |
+          go run ./cmd/gendocs
+          git diff --exit-code docs/
+      - name: Claude Desktop extension manifest validates
+        run: |
+          go run ./cmd/mcpb -os windows -dir build/mcpb
+          npx -y @anthropic-ai/mcpb@2.1.2 validate build/mcpb/manifest.json
+      - name: pad Lua parses
+        run: |
+          npm install --no-save luaparse@0.3
+          node -e "
+            const lp = require('luaparse'), src = require('fs').readFileSync('mod/Nemesis.lua', 'utf8');
+            lp.parse(src, { luaVersion: '5.2' });
+            lp.parse(src.match(/PLAYER_PAD_SCRIPT = \[==\[([\s\S]*?)\]==\]/)[1], { luaVersion: '5.2' });
+            console.log('Lua OK');"
