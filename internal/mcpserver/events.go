@@ -127,7 +127,7 @@ func Render(e Event) string {
 			line += " face-down"
 		}
 		if c.Oracle != "" && !isLandPlay(e) {
-			line += " | " + oneLineText(c.Oracle, 220)
+			line += " | " + oneLineText(c.Oracle, playTextMax)
 		}
 		switch {
 		case isLandPlay(e):
@@ -140,11 +140,17 @@ func Render(e Event) string {
 	case "turn":
 		if e.Bool("claude") {
 			line := "[turn] YOUR turn (" + s("color") + ")"
+			if e.Bool("first") {
+				line += ". This is your FIRST turn since the game was set up: if the table has not agreed who goes first, ask before begin_turn"
+			}
 			if w := s("endStep"); w != "" {
 				line += ". Before begin_turn it is still " + or(s("prev"), "the last player") +
 					"'s end step: you could play " + w + " (or flashback from your graveyard)"
 			}
 			return line
+		}
+		if e.Bool("tookBack") {
+			return "[turn] " + s("color") + "'s turn: the table moved the marker off you, so YOUR turn is over (undo anything the table did not accept)"
 		}
 		return "[turn] " + s("color") + "'s turn"
 	case "round":
@@ -272,6 +278,10 @@ func cardLine(c cards.Card) string {
 	}
 	return out
 }
+
+// playTextMax keeps a [play] line readable but long enough for wordy cards
+// (Itazura, Lingering Wick ran past the old 220).
+const playTextMax = 700
 
 func oneLineText(s string, n int) string {
 	s = strings.Join(strings.Fields(s), " ")

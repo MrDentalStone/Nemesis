@@ -2,7 +2,7 @@
 // bundles nemesis-mcp, with the tool list taken from the server itself.
 // Pack the folder with Anthropic's CLI afterwards:
 //
-//	go run ./cmd/mcpb -version v1.0.0 -os windows -dir build/mcpb-windows
+//	go run ./cmd/mcpb -version v1.1.0 -os windows -dir build/mcpb-windows
 //	npx @anthropic-ai/mcpb pack build/mcpb-windows nemesis.mcpb
 //
 // The folder must hold server/nemesis-mcp(.exe); -build compiles it there.
@@ -28,7 +28,7 @@ import (
 )
 
 func main() {
-	version := flag.String("version", "v1.0.0", "release version (a leading v is dropped)")
+	version := flag.String("version", "v1.1.0", "release version (a leading v is dropped)")
 	goos := flag.String("os", "windows", "windows or darwin")
 	arch := flag.String("arch", "amd64", "GOARCH for -build")
 	dir := flag.String("dir", "build/mcpb", "bundle folder")

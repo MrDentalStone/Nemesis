@@ -87,7 +87,11 @@ The table's play mode decides how hard you play: `mode_rules` gives the current 
    cards you put under. Say "keeping 7" / "going to 6".
 5. Life: `reset_life` your own tracker to 40. Ask before touching others'.
 6. Who goes first: roll for game one; after that the loser of the last game goes
-   first. In a 2-player game the first player skips their first draw.
+   first. In a 2-player game the first player skips their first draw. Settle it
+   **before** acting on a turn: a marker pass while the humans are still setting up
+   can hand you a turn nobody meant (the `[turn]` line says when it is your first
+   turn since `reset_board`). If the table then moves the marker off you, the line
+   says your turn is over: put back anything you drew or played and wait.
 
 **Other players' turns**
 <!-- chat-clients -->
@@ -114,6 +118,10 @@ The table's play mode decides how hard you play: `mode_rules` gives the current 
     when the numbers are clear. In a multiplayer game where the target is unclear,
     ask once. If they only tapped for an ability, say nothing.
   - `[chat]`: answer if it's for you; respond to "any responses?" quickly.
+  - Secret choices (Itazura's number, a hidden vote): `say(text, to="<colour>")`
+    whispers to that seat only; the table just sees that you whispered.
+  - A `[play]` line or `table_state` lacks a card's full text: `parse_card(guid=...)`
+    reads any face-up public card.
   - `[button] respond` from a player pad with no round open: that player is giving
     you priority on their spell or trigger. Look at `table_state` and either act or
     `say("no responses")`.
@@ -147,7 +155,10 @@ The table's play mode decides how hard you play: `mode_rules` gives the current 
 1. Untap and draw: `begin_turn` untaps everything, draws 1 and returns your hand and
    the table in one call; do not untap, draw or read the table again after it. Later
    draws come only from card effects: `draw(reason="Ponder")` (`skip_draw=true` for the first player's first turn in a
-   2-player game, see RULES.md).
+   2-player game, see RULES.md). When a card on the table acts before the draw
+   (Mesmeric Orb mills for each permanent that untapped, Maralen replaces the draw,
+   upkeep triggers), `begin_turn` holds the draw and lists them: resolve them, then
+   `draw()` for the turn unless one replaced it.
 2. Upkeep triggers: say them.
 3. Main 1: land with `play(row=land)`. Every spell goes through `cast(guid, tap=[...],
    note=...)`: it taps the mana, announces the spell, gives the table a quiet window to
@@ -176,6 +187,14 @@ counters (`mark`, tiles via `counter`), tokens (one card plus a counter, hard ru
 table has no attach), commander tax, your own triggers, life changes from your own
 cards (Sheoldred-style draw taxes, Castle Locthwain). Keep a short running note;
 re-read `table_state` rather than trusting memory when it matters.
+
+**A player is out** (0 life, 21 commander damage, or a scoop): everything they own
+leaves the game with them, including their permanents still on the table and
+anything of theirs you control (an Animate Dead target, a stolen creature); control
+effects they made end. Move their cards off your board and say so. The table marks
+a player who is out with a **Turn Skipper** puck on their mat (it skips their turns);
+`table_state` shows such a seat, or one at 0 life, as OUT OF THE GAME. Never place or
+move the puck yourself; if someone is out and has none, mention it once.
 
 **Ending a game**: when someone scoops, say GG, leave their tracker to them, then
 `reset_board` for the next game.

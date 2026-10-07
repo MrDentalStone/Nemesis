@@ -20,7 +20,7 @@ import (
 )
 
 // set by the release build (-ldflags "-X main.version=...")
-var version = "v1.0.0"
+var version = "v1.1.0"
 
 func main() {
 	opts := app.RegisterFlags(flag.CommandLine)

@@ -56,6 +56,9 @@ func registerActions(s *mcp.Server, d Deps) {
 			if err != nil {
 				return nil, nil, err
 			}
+			if !drew {
+				setDrew(true) // the turn's draw, held back by begin_turn
+			}
 			// deal() animates; the hand zone only owns the cards once they land
 			select {
 			case <-time.After(1800 * time.Millisecond):
@@ -78,7 +81,7 @@ func registerActions(s *mcp.Server, d Deps) {
 	type beginIn struct {
 		SkipDraw bool `json:"skip_draw,omitempty" jsonschema:"skip the draw (the first player's first turn in a 2-player game)"`
 	}
-	mcp.AddTool(s, &mcp.Tool{Name: "begin_turn", Description: "Start your turn in one call: untap everything, draw 1 (unless skip_draw), then return your hand and the whole table. Say your upkeep triggers yourself."},
+	mcp.AddTool(s, &mcp.Tool{Name: "begin_turn", Description: "Start your turn in one call: untap everything, draw 1 (unless skip_draw), then return your hand and the whole table. If a card on the table acts on untapping, upkeep or the draw step (Mesmeric Orb, Maralen), the draw is held and listed so you resolve those first. Say your upkeep triggers yourself."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in beginIn) (*mcp.CallToolResult, any, error) {
 			var b strings.Builder
 			// the pad must know it is your turn, or end_turn refuses later
@@ -87,11 +90,36 @@ func registerActions(s *mcp.Server, d Deps) {
 				return nil, nil, err
 			}
 			setDrew(true)
-			if _, err := call(ctx, "untap", map[string]any{"all": true}); err != nil {
+			r, err := call(ctx, "untap", map[string]any{"all": true})
+			if err != nil {
 				return nil, nil, err
 			}
-			b.WriteString("Untapped everything.\n")
+			var untapped struct {
+				Untapped []string `json:"untapped"`
+			}
+			_ = json.Unmarshal([]byte(r), &untapped)
+			fmt.Fprintf(&b, "Untapped everything (%d permanents were tapped).\n", len(untapped.Untapped))
+			// setRotationSmooth takes about a second; a snapshot read before it
+			// lands still shows the cards tapped
+			select {
+			case <-time.After(1200 * time.Millisecond):
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			}
+			var held []string
 			if !in.SkipDraw {
+				if snap, err := d.Pad.Snapshot(ctx); err == nil {
+					held = beforeDraw(snap)
+				}
+			}
+			if len(held) > 0 {
+				setDrew(false)
+				b.WriteString("NOT drawn yet. Before your draw, these act on your untap step, upkeep or draw:\n")
+				for _, h := range held {
+					b.WriteString("  - " + h + "\n")
+				}
+				b.WriteString("Say and resolve them now (mills, life loss, a replaced draw), then take your turn's draw with draw() unless one of them replaces it.\n")
+			} else if !in.SkipDraw {
 				if _, err := call(ctx, "draw", map[string]any{"n": 1}); err != nil {
 					return nil, nil, err
 				}
@@ -116,7 +144,11 @@ func registerActions(s *mcp.Server, d Deps) {
 				return nil, nil, err
 			}
 			b.WriteString("\n" + renderSnapshot(snap))
-			b.WriteString("\n(That is your hand and the table: no need for my_hand or table_state now. Do not untap or draw again.)")
+			if len(held) > 0 {
+				b.WriteString("\n(That is your hand and the table. Do not untap again; your turn's draw is still to come, after the cards listed at the top.)")
+			} else {
+				b.WriteString("\n(That is your hand and the table: no need for my_hand or table_state now. Do not untap or draw again.)")
+			}
 			return text(b.String()), nil, nil
 		})
 

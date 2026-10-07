@@ -28,12 +28,13 @@ Block until something happens at the table, then return every event so far, one 
 
 ### `parse_card`
 
-Parse a TTS card nickname/description into name, type, mana, oracle text and P/T (the importer's name, type line and mana value format, or a plain name).
+Full text of a public card: pass its guid from table_state (any player's face-up battlefield, graveyard, exile or command zone card) when a [play] line or your memory is not enough. Or parse a TTS nickname/description you already have.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `nick` (required) | string | the card's TTS nickname as shown by table_state |
 | `desc` | string | its TTS description, if you have it |
+| `guid` | string | a face-up card anyone has on the battlefield, in a graveyard, in exile or in a command zone (the [guid] in table_state): returns its full text |
+| `nick` | string | or: the card's TTS nickname as shown by table_state |
 
 ### `tts_log`
 
@@ -47,12 +48,13 @@ Recent print/error output captured from Tabletop Simulator's Lua. Check this whe
 
 ### `say`
 
-Speak in TTS chat as yourself. Announce intent BEFORE acting, answer questions, call out life changes.
+Speak in TTS chat as yourself. Announce intent BEFORE acting, answer questions, call out life changes. With to=<colour>, whisper privately to that seat (secret choices).
 
 | Parameter | Type | Description |
 |---|---|---|
 | `text` (required) | string | what to say in table chat, as yourself, the player |
 | `loud` | boolean | also flash it on everyone's screen (use for attacks, big plays, questions) |
+| `to` | string | whisper to this seat colour only (secret numbers, hidden votes); the table sees that you whispered, not what |
 
 ### `ask_table`
 
@@ -140,7 +142,7 @@ Build a deck with the table's deck importer, place it in your library and comman
 
 ### `begin_turn`
 
-Start your turn in one call: untap everything, draw 1 (unless skip_draw), then return your hand and the whole table. Say your upkeep triggers yourself.
+Start your turn in one call: untap everything, draw 1 (unless skip_draw), then return your hand and the whole table. If a card on the table acts on untapping, upkeep or the draw step (Mesmeric Orb, Maralen), the draw is held and listed so you resolve those first. Say your upkeep triggers yourself.
 
 | Parameter | Type | Description |
 |---|---|---|

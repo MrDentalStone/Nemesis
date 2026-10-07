@@ -107,6 +107,30 @@ to it (`lateFor`).
 word decides ("no", "go", "ok" pass; "wait", "hold", "respond" hold the round), and
 silence for the pad's wait (the **Wait** button, default 15 s) counts as no responses.
 
+## Fixed in v1.1.0 (not yet checked at the table)
+
+From the 2026-10-07 four-player game (pad v1.0.0.1):
+
+- `search_library` and `reveal_until` failed with "pattern too complex": TTS's Lua
+  gives up on `'^(.-)\n\n'` over long oracle text. `descHeader()` cuts the
+  description with a plain `string.find` instead.
+- A turn the table took back (the pad passed the marker to Kestrel during set-up,
+  then the humans moved it on) left `claudeTurn` set, so every later pass over
+  Kestrel's seat was ignored. A marker move during Kestrel's turn now ends it
+  (`[turn] ... the table moved the marker off you`), and the first turn after
+  `reset_board` is flagged so Kestrel checks who goes first.
+- `begin_turn` drew before untap-step and upkeep effects (Mesmeric Orb, Maralen of
+  the Mornsong). It now lists such cards (`beforeDraw` in `minor.go`) and holds
+  the draw for `draw()`. It also waits for the untap animation, so the table it
+  returns no longer shows lands still tapped.
+- `[play]` lines cut oracle text at 220 characters; now 700.
+  `parse_card(guid=...)` reads any face-up public card in full.
+- `say(to=<colour>)` whispers to one seat, for secret numbers and hidden votes.
+- `table_state` marks a seat as OUT OF THE GAME when the table's Turn Skipper puck
+  sits on its mat (the tables' own way to skip a dead or scooped player) or its life
+  is 0 or less (`seatOut` in `minor.go`), and PLAYBOOK/RULES say that a player who
+  leaves takes everything they own with them (CR 800.4a).
+
 ## Fixed in v1.0.0
 
 The five issues from the 2026-10-06 live game (pad v0.9.1), each checked at the

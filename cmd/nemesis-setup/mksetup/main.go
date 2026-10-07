@@ -3,7 +3,7 @@
 // installer embeds), copies the docs players may want next to them, then
 // builds the installer as a GUI program (no console window).
 //
-//	go run ./cmd/nemesis-setup/mksetup -version v1.0.0 -out build/NemesisSetup.exe
+//	go run ./cmd/nemesis-setup/mksetup -version v1.1.0 -out build/NemesisSetup.exe
 package main
 
 import (

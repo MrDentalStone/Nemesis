@@ -128,6 +128,10 @@ yes lets you touch their tracker, and only for agreed numbers.
   drawing from an empty library: that player loses.
 - Legend rule. Auras with no legal target go to the graveyard. Tokens outside
   the battlefield cease to exist.
+- A player who loses or scoops leaves the game: every object they own leaves
+  with them (Mesmeric Orb stops milling), spells and abilities they control
+  end, and control-changing effects they made end (CR 800.4a). Cards of
+  theirs you control leave the game too.
 - Commander going to graveyard, exile, hand or library: its owner may put it
   in the command zone instead (so Chaos Warp on a commander is a bounce with
   a tax, not a shuffle). Commander tax: +{2} for each previous cast from the

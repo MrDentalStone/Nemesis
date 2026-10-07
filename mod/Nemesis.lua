@@ -12,7 +12,7 @@
 -- and nothing here is reachable from chat.
 
 nemesisPad = true          -- marker the Go side scans for
-NEMESIS_VERSION = 'v1.0.0'
+NEMESIS_VERSION = 'v1.1.0'
 
 -- the deck importer the MTG tables ship with; nemesis-mcp passes its own URL
 local IMPORTER = 'https://importer.rikrassen.com'
@@ -110,12 +110,28 @@ local function seatIndex(color)
   return 1
 end
 
--- next/previous SEATED colour after/before Claude's slot
+-- The tables mark a player who is out (dead or scooped) with a Turn Skipper
+-- puck on their mat; its own script skips their turn, but it has thrown Lua
+-- errors on some tables, so the pad passes over such a seat itself.
+function seatSkipped(color)
+  local ok, out = pcall(function()
+    local d = seatData(color)
+    if d == nil or d.playmat == nil then return false end
+    for _, o in ipairs(d.playmat.getObjects()) do
+      if string.sub(o.getName(), 1, 12) == 'Turn Skipper' then return true end
+    end
+    return false
+  end)
+  return ok and out
+end
+
+-- next/previous SEATED colour after/before Claude's slot, passing over seats
+-- the table has marked out with a Turn Skipper
 function neighbourSeat(dir)
   local i = seatIndex(state.seat)
   for step = 1, #COLORS do
     local c = COLORS[((i - 1 + dir * step) % #COLORS) + 1]
-    if Player[c].seated then return c end
+    if Player[c].seated and not seatSkipped(c) then return c end
   end
   return nil
 end
@@ -126,7 +142,11 @@ function startClaudeTurn(prev)
   Turns.enable = false
   broadcastToAll("[Nemesis] " .. NAME .. "'s turn (" .. state.seat .. ")", Color.fromString(state.seat))
   setStatus(NAME .. "'s turn")
-  emit({ ev = 'turn', color = state.seat, prev = prev, claude = true })
+  -- the first turn after reset_board: the table may not have settled who
+  -- goes first yet (a marker pass at set-up is not always a real turn)
+  local first = state.gameTurns == 0
+  if state.gameTurns then state.gameTurns = state.gameTurns + 1 end
+  emit({ ev = 'turn', color = state.seat, prev = prev, claude = true, first = first })
 end
 
 -- Did a turn passing from `from` to `to` (seat order) go over Claude's slot?
@@ -158,7 +178,17 @@ function onPlayerTurn(player, previous)
     return
   end
   state.justEnded = nil
-  if state.seat and not state.claudeTurn and passesClaude(prev, player.color) then
+  if state.claudeTurn then
+    -- the marker is frozen during Claude's turn, so a human switched turns
+    -- back on and moved it: the table took the turn back (a wrong start,
+    -- "Mickle goes first"). Without this the pad still thought it was
+    -- Claude's turn and let every later pass skip Claude's seat.
+    state.claudeTurn = false
+    setStatus(player.color .. "'s turn")
+    emit({ ev = 'turn', color = player.color, prev = prev, tookBack = true })
+    return
+  end
+  if state.seat and passesClaude(prev, player.color) then
     -- TTS skipped over Claude's slot: this is really Claude's turn
     startClaudeTurn(prev)
     return
@@ -1516,6 +1546,15 @@ function ops.say(req)
   local text = tostring(req.text or '')
   if text == '' then error('nothing to say') end
   local col = Color.fromString(state.seat)
+  if req.to and req.to ~= '' then
+    -- a private line (a secret number, a hidden choice): only that seat
+    -- reads it; everyone sees that a whisper happened
+    local p = Player[req.to]
+    if p == nil or not p.seated then error(tostring(req.to) .. ' is not seated') end
+    printToColor('[' .. NAME .. ' whispers] ' .. text, req.to, col)
+    printToAll('[' .. NAME .. '] (whispered to ' .. req.to .. ')', col)
+    return { whispered = req.to }
+  end
   -- broadcastToAll also writes the line to chat, so a loud line must not be
   -- printed as well or it shows up twice
   if req.loud then broadcastToAll('[' .. NAME .. '] ' .. text, col) else printToAll('[' .. NAME .. '] ' .. text, col) end
@@ -2012,6 +2051,15 @@ function ops.look(req)
   return { cards = out, order = 'top first', note = 'cards are in the secondary hand zone; move them back or keep them' }
 end
 
+-- The header of a card description: everything before the first blank line.
+-- A plain find, because TTS's Lua gives up on '^(.-)\n\n' over long oracle
+-- text ("pattern too complex").
+local function descHeader(desc)
+  local i = string.find(desc, '\n\n', 1, true)
+  if i then return string.sub(desc, 1, i - 1) end
+  return desc
+end
+
 -- show cards to everyone: announced in chat and laid face up on the stack spot
 -- Tutor: take up to n cards whose name/type line matches query out of
 -- Claude's library and put them where the effect says, then shuffle. Only the
@@ -2030,7 +2078,7 @@ function ops.search(req)
   -- (everything before the first blank line) unless req.desc asks for all.
   local function haystack(name, desc)
     local dsc = desc or ''
-    if not req.desc then dsc = dsc:match('^(.-)\n\n') or dsc end
+    if not req.desc then dsc = descHeader(dsc) end
     return string.lower(name or '') .. '\n' .. string.lower(dsc)
   end
   local function matching()
@@ -2182,7 +2230,7 @@ function ops.reveal_until(req)
     if c == nil then break end
     state.touched[c.getGUID()] = Time.time
     local name, desc = c.getName(), c.getDescription()
-    local hay = string.lower(name .. '\n' .. (desc:match('^(.-)\n\n') or desc))
+    local hay = string.lower(name .. '\n' .. descHeader(desc))
     -- mana value: klrmngr cards say "3CMC" in the nick; plain-name cards put the
     -- cost line first in the description ("{2}{G}")
     local cmc = tonumber((name .. ' ' .. desc):match('(%d+)%s*CMC'))
@@ -2238,6 +2286,7 @@ function ops.reset_board(req)
   end
   state.looked = {}
   state.claudeTurn = false
+  state.gameTurns = 0
   Turns.enable = true
   return { seat = seat, removed = gone, life = 40 }
 end

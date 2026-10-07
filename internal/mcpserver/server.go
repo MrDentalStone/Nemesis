@@ -79,13 +79,17 @@ func Register(s *mcp.Server, d Deps) {
 	type sayIn struct {
 		Text string `json:"text" jsonschema:"what to say in table chat, as yourself, the player"`
 		Loud bool   `json:"loud,omitempty" jsonschema:"also flash it on everyone's screen (use for attacks, big plays, questions)"`
+		To   string `json:"to,omitempty" jsonschema:"whisper to this seat colour only (secret numbers, hidden votes); the table sees that you whispered, not what"`
 	}
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "say",
-		Description: "Speak in TTS chat as yourself. Announce intent BEFORE acting, answer questions, call out life changes.",
+		Description: "Speak in TTS chat as yourself. Announce intent BEFORE acting, answer questions, call out life changes. With to=<colour>, whisper privately to that seat (secret choices).",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in sayIn) (*mcp.CallToolResult, any, error) {
-		if err := d.Pad.Call(ctx, "say", map[string]any{"text": in.Text, "loud": in.Loud}, nil); err != nil {
+		if err := d.Pad.Call(ctx, "say", map[string]any{"text": in.Text, "loud": in.Loud, "to": in.To}, nil); err != nil {
 			return nil, nil, err
+		}
+		if in.To != "" {
+			return text("whispered to " + in.To + ": " + in.Text), nil, nil
 		}
 		return text("said: " + in.Text), nil, nil
 	})
@@ -205,13 +209,28 @@ func Register(s *mcp.Server, d Deps) {
 	})
 
 	type cardIn struct {
-		Nick string `json:"nick" jsonschema:"the card's TTS nickname as shown by table_state"`
+		GUID string `json:"guid,omitempty" jsonschema:"a face-up card anyone has on the battlefield, in a graveyard, in exile or in a command zone (the [guid] in table_state): returns its full text"`
+		Nick string `json:"nick,omitempty" jsonschema:"or: the card's TTS nickname as shown by table_state"`
 		Desc string `json:"desc,omitempty" jsonschema:"its TTS description, if you have it"`
 	}
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "parse_card",
-		Description: "Parse a TTS card nickname/description into name, type, mana, oracle text and P/T (the importer's name, type line and mana value format, or a plain name).",
+		Description: "Full text of a public card: pass its guid from table_state (any player's face-up battlefield, graveyard, exile or command zone card) when a [play] line or your memory is not enough. Or parse a TTS nickname/description you already have.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in cardIn) (*mcp.CallToolResult, any, error) {
+		if in.GUID != "" {
+			snap, err := d.Pad.Snapshot(ctx)
+			if err != nil {
+				return nil, nil, err
+			}
+			nick, desc, ok := publicCard(snap, in.GUID)
+			if !ok {
+				return nil, nil, fmt.Errorf("no face-up public card [%s] on the table (hands, libraries and face-down cards stay hidden)", in.GUID)
+			}
+			return text(renderCard(pad.Card{GUID: in.GUID, Card: cards.Parse(nick, desc)}, "")), nil, nil
+		}
+		if in.Nick == "" {
+			return nil, nil, fmt.Errorf("give a guid or a nick")
+		}
 		return text(renderCard(pad.Card{Card: cards.Parse(in.Nick, in.Desc)}, "")), nil, nil
 	})
 
@@ -313,6 +332,26 @@ func renderCard(c pad.Card, zone string) string {
 	return b.String()
 }
 
+// publicCard finds a face-up card anyone can see by guid: a permanent, or a
+// card in a graveyard, exile or command zone.
+func publicCard(s *pad.Snapshot, guid string) (nick, desc string, ok bool) {
+	for _, seat := range s.Seats {
+		for _, p := range seat.Battlefield {
+			if p.GUID == guid && !p.FaceDown && p.Nick != "" {
+				return p.Nick, p.Desc, true
+			}
+		}
+		for _, pile := range [][]pad.RawCard{seat.Graveyard, seat.Exile, seat.Command} {
+			for _, c := range pile {
+				if c.GUID == guid && !c.FaceDown {
+					return c.Nick, c.Desc, true
+				}
+			}
+		}
+	}
+	return "", "", false
+}
+
 func renderSnapshot(s *pad.Snapshot) string {
 	var b strings.Builder
 	whose := s.Turns.Active
@@ -362,6 +401,11 @@ func renderSnapshot(s *pad.Snapshot) string {
 			}
 		}
 		b.WriteByte('\n')
+		if why := seatOut(seat); why != "" && !seat.IsClaude {
+			// CR 800.4a: a player who leaves takes everything they own with
+			// them, and control effects they made end
+			b.WriteString("   OUT OF THE GAME (" + why + "): everything they own has left the game, so ignore the cards still shown for them; anything of theirs you control leaves too (move it off your board).\n")
+		}
 		var cd []string
 		for _, c := range seat.CommanderDamage {
 			if c.Amount != nil && *c.Amount > 0 {

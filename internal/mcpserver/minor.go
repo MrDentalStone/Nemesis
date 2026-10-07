@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/MrDentalStone/Nemesis/internal/cards"
+	"github.com/MrDentalStone/Nemesis/internal/pad"
 )
 
 // Which of your spells get a response window. A casual table does not want
@@ -107,4 +109,63 @@ func lateResponse() string {
 		return ""
 	}
 	return turnState.quietName + " [" + turnState.quietGUID + "], now in " + turnState.quietTo
+}
+
+// seatOut says why a seat is out of the game, or "" while it still plays.
+// The tables mark a dead or scooped player with a Turn Skipper puck on their
+// mat (its script skips their turns), which also catches a scoop at any life
+// total; 0 life covers a table without the puck or a puck not yet placed.
+func seatOut(seat pad.Seat) string {
+	for _, p := range seat.Battlefield {
+		if strings.HasPrefix(p.Nick, "Turn Skipper") {
+			return "Turn Skipper on their mat"
+		}
+	}
+	if seat.Life != nil && *seat.Life <= 0 {
+		return "life 0 or less"
+	}
+	return ""
+}
+
+// Phrases that make a card act between your untap and your draw. Anyone's
+// card: Mesmeric Orb mills on untap, Maralen replaces every draw. Opponents'
+// cards: Smothering Tithe-style taxes on a draw. Your own cards: your upkeep
+// and draw step triggers.
+var (
+	beforeDrawAny    = []string{"becomes untapped", "become untapped", "doesn't untap", "don't untap", "can't untap", "untap step", "each upkeep", "each player's upkeep", "each opponent's upkeep", "can't draw", "each player's draw step", "each draw step", "each opponent's draw step", "would draw"}
+	beforeDrawTheirs = []string{"draws a card"}
+	beforeDrawMine   = []string{"your upkeep", "your draw step"}
+)
+
+// beforeDraw lists the permanents that act on your untap step, upkeep or
+// draw, so begin_turn holds the draw until you have resolved them (Mesmeric
+// Orb mills before you draw; with Maralen you never draw at all).
+func beforeDraw(s *pad.Snapshot) []string {
+	var out []string
+	for _, seat := range s.Seats {
+		if !seat.IsClaude && seatOut(seat) != "" {
+			continue // out of the game: its permanents left with it
+		}
+		keys := append([]string{}, beforeDrawAny...)
+		owner := seat.Color
+		if seat.IsClaude {
+			keys, owner = append(keys, beforeDrawMine...), "yours"
+		} else {
+			keys = append(keys, beforeDrawTheirs...)
+		}
+		for _, p := range seat.Battlefield {
+			if p.FaceDown || p.Nick == "" {
+				continue
+			}
+			c := cards.Parse(p.Nick, p.Desc)
+			o := strings.ToLower(c.Oracle)
+			for _, k := range keys {
+				if o != "" && strings.Contains(o, k) {
+					out = append(out, fmt.Sprintf("%s [%s] (%s): %s", c.Name, p.GUID, owner, oneLineText(c.Oracle, 300)))
+					break
+				}
+			}
+		}
+	}
+	return out
 }
