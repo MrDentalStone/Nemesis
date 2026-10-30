@@ -27,5 +27,7 @@ jobs:
           node -e "
             const lp = require('luaparse'), src = require('fs').readFileSync('mod/Nemesis.lua', 'utf8');
             lp.parse(src, { luaVersion: '5.2' });
-            lp.parse(src.match(/PLAYER_PAD_SCRIPT = \[==\[([\s\S]*?)\]==\]/)[1], { luaVersion: '5.2' });
+            const inner = [...src.matchAll(/^([A-Z_]+_SCRIPT) = \[==\[([\s\S]*?)\]==\]/gm)];
+            if (inner.length === 0) throw new Error('no embedded *_SCRIPT blocks found');
+            for (const [, name, body] of inner) { lp.parse(body, { luaVersion: '5.2' }); console.log(name + ' OK'); }
             console.log('Lua OK');"
