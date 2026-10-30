@@ -32,7 +32,7 @@ func main() {
 	for _, cmd := range []string{"nemesis-mcp", "nemesis-cli"} {
 		build(filepath.Join(payload, cmd+".exe"), ld, "./cmd/"+cmd)
 	}
-	for _, f := range []string{"README.md", "PLAYBOOK.md", "RULES.md", "LICENSE"} {
+	for _, f := range []string{"README.md", "PLAYBOOK.md", "RULES.md", "DRAFT.md", "LICENSE"} {
 		data, err := os.ReadFile(f)
 		if err != nil {
 			fatal(err)

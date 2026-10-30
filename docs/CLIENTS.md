@@ -49,7 +49,9 @@ claude mcp add nemesis -- C:\path\to\nemesis-mcp.exe
 ```
 
 Or, in a checkout, the repo's `.mcp.json` already points at `bin/nemesis-mcp.exe`;
-build it and start Claude Code in the folder. Check with `claude mcp list`.
+build it and start Claude Code in the folder. The path is relative, so a session
+started anywhere else does not find the server: use `claude mcp add` with the full
+path for that (`nemesis-setup` does it for you). Check with `claude mcp list`.
 
 If Claude Code says enterprise MCP configuration is active, add the server to the
 managed config instead (on Windows `C:\Program Files\ClaudeCode\managed-mcp.json`):
@@ -58,8 +60,8 @@ managed config instead (on Windows `C:\Program Files\ClaudeCode\managed-mcp.json
 { "mcpServers": { "nemesis": { "type": "stdio", "command": "C:\\path\\to\\nemesis-mcp.exe", "args": [] } } }
 ```
 
-Claude Code has no short tool timeout, so the playbook's `wait_for_event` loop can
-use `timeout_seconds=240`.
+Claude Code moves a tool call to the background after 120 s, which stalls the
+playbook's `wait_for_event` loop, so use `timeout_seconds=100`.
 
 ## Claude Desktop (Free plan)
 

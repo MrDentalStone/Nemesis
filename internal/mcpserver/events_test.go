@@ -24,6 +24,15 @@ func TestRenderPlay(t *testing.T) {
 	if got := Render(forest); strings.Contains(got, "respond") {
 		t.Errorf("a land should not talk about responses: %q", got)
 	}
+	// White dropped a Cyclonic Rift on Blue's mat: White cast it, at Blue
+	rift := Event{"ev": "play", "color": "White", "onto": "Blue", "player": "Dee", "from": "hand", "to": "battlefield",
+		"name": "Cyclonic Rift\nInstant 2CMC", "desc": "Return target nonland permanent you don't control to its owner's hand."}
+	got = Render(rift)
+	for _, want := range []string{"[play] White (Dee): Cyclonic Rift", "dropped on Blue's board: White cast it"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("%q lacks %q", got, want)
+		}
+	}
 }
 
 func TestRenderIsShorterThanJSON(t *testing.T) {

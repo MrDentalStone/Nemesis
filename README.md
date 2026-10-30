@@ -5,7 +5,9 @@ An AI player for Magic: The Gathering Commander in Tabletop Simulator.
 Nemesis seats an AI (Claude, GPT, Gemini or a local model) at your TTS Commander
 table as a real opponent. It plays its own deck, talks in table chat, answers your
 spells and attacks, lets you answer its own, and checks your attacks against the
-rules. It only ever sees its own hand.
+rules. It only ever sees its own hand. It can also run and join a **draft** (a set's
+boosters straight from the deck importer, or a cube) with any number of players: Winston for two, pick-two for three or
+four, booster draft for more.
 
 It has two parts:
 
@@ -92,11 +94,16 @@ if it holds an instant or an ability it could use, decides whether to respond ("
 on, in response..."). When the AI casts a spell, it leaves a few seconds to respond
 without asking: **drop your counterspell or removal on its mat** (or say "wait"), and
 it reads the card and answers it or accepts it. Cards you drop on its mat at other
-times work the same way. **Attack it by tapping your creatures** on your turn; it
-checks them, says its blocks and takes the damage. When it does ask the table
-something, answer in chat ("no", "go", "wait", "yes"); silence for 15 seconds counts
-as no, and the **Wait** button on the pad changes that. Tables that like buttons can
-still press **Pads: off** to put small Yes / No / Respond pads at every seat.
+times work the same way. **Attack it by tapping your creatures and pressing its attack
+pad** (the small red pad by its life tracker); it checks them, says its blocks and
+takes the damage. In a game with other opponents it leaves your creatures alone unless
+the attack pad is lit, so it never has to ask who you are attacking. When it does ask
+the table something, answer in chat ("no", "go", "wait", "yes"); silence for 15
+seconds counts as no, and the **Wait** button on the pad changes that. For the big
+moments (its board wipes, huge threats, see [HEAVY_HITTERS.md](HEAVY_HITTERS.md)) a
+**decision pad** appears on each affected player's mat with a countdown: Yes to
+respond, No to let it resolve, Wait to pause the clock. **Big pads: off** on the admin
+pad turns them off.
 
 Players move their own life trackers. The AI asks once per game whether it may apply
 agreed damage to yours. **Undo** asks it to reverse its last action; **STOP** freezes
@@ -123,6 +130,7 @@ anything. See [docs/CONTENT.md](docs/CONTENT.md).
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Building, testing, the pad protocol, project layout |
 | [PLAYBOOK.md](PLAYBOOK.md) | How the AI plays at the table (the AI reads this) |
 | [RULES.md](RULES.md) | The Commander rules guide the AI checks claims against |
+| [DRAFT.md](DRAFT.md) | How the AI drafts, builds a 40-card deck and plays limited |
 
 ## Credits and legal
 

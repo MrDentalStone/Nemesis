@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -43,9 +44,20 @@ type Card struct {
 	Power           string            `json:"power"`
 	Toughness       string            `json:"toughness"`
 	OracleText      string            `json:"oracle_text"`
+	ManaCost        string            `json:"mana_cost"`
+	Rarity          string            `json:"rarity"`
 	CardFaces       []struct {
-		Name string `json:"name"`
+		Name     string `json:"name"`
+		ManaCost string `json:"mana_cost"`
 	} `json:"card_faces"`
+}
+
+// Cost is the card's mana cost; a double-faced card's is its front face's.
+func (c Card) Cost() string {
+	if c.ManaCost == "" && len(c.CardFaces) > 0 {
+		return c.CardFaces[0].ManaCost
+	}
+	return c.ManaCost
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
@@ -116,6 +128,32 @@ func (c *Client) Search(ctx context.Context, q, order string) ([]Card, error) {
 		return nil, err
 	}
 	return page.Data, nil
+}
+
+// SearchAll follows a search through every page (at most pages of them).
+func (c *Client) SearchAll(ctx context.Context, q string, pages int) ([]Card, error) {
+	path := "/cards/search?" + url.Values{"q": {q}}.Encode()
+	var all []Card
+	for i := 0; i < pages && path != ""; i++ {
+		var page struct {
+			Data     []Card `json:"data"`
+			HasMore  bool   `json:"has_more"`
+			NextPage string `json:"next_page"`
+		}
+		if err := c.do(ctx, http.MethodGet, path, nil, &page); err != nil {
+			var se *Error
+			if errors.As(err, &se) && se.Status == http.StatusNotFound {
+				return all, nil
+			}
+			return nil, err
+		}
+		all = append(all, page.Data...)
+		path = ""
+		if page.HasMore {
+			path = strings.TrimPrefix(page.NextPage, base)
+		}
+	}
+	return all, nil
 }
 
 // Collection looks cards up by exact name, 75 per request. found maps each

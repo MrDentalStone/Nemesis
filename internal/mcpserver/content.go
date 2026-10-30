@@ -16,12 +16,12 @@ import (
 // the decks. They work without a table, so an AI can prepare before TTS is up.
 func registerContent(s *mcp.Server, d Deps) {
 	type playbookIn struct {
-		Part string `json:"part,omitempty" jsonschema:"playbook (default: how to play at this table) | rules (the Commander rules guide and its opponent-turn checklists) | all"`
+		Part string `json:"part,omitempty" jsonschema:"playbook (default: how to play at this table) | rules (the Commander rules guide and its opponent-turn checklists) | draft (drafting and limited games) | all"`
 	}
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "playbook",
 		Description: "How to play at this table: hard rules, game flow, your turn, other players' turns, tool habits. " +
-			"Read it before the first game if your client did not already load PLAYBOOK.md; part=rules gives the Commander rules guide.",
+			"Read it before the first game if your client did not already load PLAYBOOK.md; part=rules gives the Commander rules guide, part=draft how to draft.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in playbookIn) (*mcp.CallToolResult, any, error) {
 		var parts []string
 		switch strings.ToLower(in.Part) {
@@ -29,10 +29,12 @@ func registerContent(s *mcp.Server, d Deps) {
 			parts = []string{"PLAYBOOK.md"}
 		case "rules":
 			parts = []string{"RULES.md"}
+		case "draft":
+			parts = []string{"DRAFT.md"}
 		case "all":
 			parts = []string{"PLAYBOOK.md", "RULES.md"}
 		default:
-			return nil, nil, fmt.Errorf("part must be playbook, rules or all")
+			return nil, nil, fmt.Errorf("part must be playbook, rules, draft or all")
 		}
 		var b strings.Builder
 		for _, p := range parts {
@@ -70,7 +72,7 @@ func registerContent(s *mcp.Server, d Deps) {
 	}
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "mode_rules",
-		Description: "The rules for a play mode: who to target, when knockouts are allowed, what to remove, what deck to bring, plus the new-player rules that apply in every mode. Read it before choosing a deck and whenever ev=mode reports a change.",
+		Description: "The rules for a play mode: who to target, when knockouts are allowed, what to remove, what deck to bring, plus the new-player rules that apply in every mode. Read it before choosing a deck and whenever ev=mode reports a change. With no mode it reads the table live, so it can be ahead of [mode] events still queued when the mode changes fast.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in modeIn) (*mcp.CallToolResult, any, error) {
 		id := in.Mode
 		if id == "" {

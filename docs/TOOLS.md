@@ -8,7 +8,7 @@ Nemesis is a stdio MCP server. Every tool returns plain text written for the AI 
 
 ### `table_state`
 
-Everything public about the Commander table: each seat's player, life, commander damage taken, hand COUNT, library COUNT, graveyard/exile/command zone cards, and battlefield (name, tapped, face-down, land row, counter tiles resting on the card, and the on-card state players set with right-click: +1/+1 counters, loyalty, keywords, notes, phased out, token). Your own seat is flagged. Opponents' hands and all libraries are never listed - that is by design.
+Everything public at the table: per seat life, commander damage, hand and library COUNTS, graveyard, exile, command zone, and battlefield with tapped, face-down, counter tiles and on-card state. Other hands and all libraries are never listed, by design.
 
 No parameters.
 
@@ -20,7 +20,7 @@ No parameters.
 
 ### `wait_for_event`
 
-Block until something happens at the table, then return every event so far, one line each: [chat], [play] (another player cast or played a card, with its text and whether you could respond), [round] (your ask_table settled), [turn], [button] (admin pad: your_turn/undo/stop/resume/yes/no; player pads), [zone] (your cards moved), [log] (life and commander damage lines), [mode], [new_player], [seat], [import]. Use this during other players' turns instead of polling.
+Block until something happens at the table, then return the events, one line each ([chat], [play], [attack], [turn], [round], [hold], [countered], [button], [zone], [log]...). Land drops and other players' turn changes do not wake you; they come summed up with the next event. Use this during other players' turns instead of polling.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -48,7 +48,7 @@ Recent print/error output captured from Tabletop Simulator's Lua. Check this whe
 
 ### `say`
 
-Speak in TTS chat as yourself. Announce intent BEFORE acting, answer questions, call out life changes. With to=<colour>, whisper privately to that seat (secret choices).
+Speak in TTS chat as yourself: one short line (TTS keeps no chat history, long lines scroll away). Announce intent before acting, answer questions. With to=<colour>, whisper to that seat only (secret choices).
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -58,28 +58,21 @@ Speak in TTS chat as yourself. Announce intent BEFORE acting, answer questions, 
 
 ### `ask_table`
 
-Ask the table loudly and WAIT for the answer: one per seat, from chat ('no', 'go' pass; 'wait', 'hold' respond; 'yes'/'no'), a card dropped on your board, or optional player pads. Silence for the wait settles it. Returns all_no (go on), respond by <colour> (stop, let them act; it names the card if they dropped one), or answered/timeout with answers like 'Blue=yes, White=no'. For your own spells use cast, which has its own quiet window; ask only for triggers and real questions.
+Ask the table loudly and WAIT for the answer: one per seat, from chat ('no', 'go' pass; 'wait', 'hold' respond; 'yes'/'no'), a card dropped on your board, or a decision pad (pads=true). Silence for the wait settles it. Returns all_no (go on), respond by <colour> (stop, let them act; it names the card if they dropped one), or answered/timeout with answers like 'Blue=yes, White=no'. For your own spells use cast, which has its own quiet window; ask only for triggers and real questions.
 
 | Parameter | Type | Description |
 |---|---|---|
 | `text` (required) | string | the question, e.g. 'Casting Craterhoof Behemoth, any responses?' or 'Want me to apply agreed damage to your tracker?' |
 | `kind` | string | responses (default) or yesno |
+| `pads` | boolean | a heavy decision: put a Yes / No / Wait pad with a countdown on each asked seat's mat (if the table has decision pads on). Only for decisions that really matter |
 | `seats` | null or array | colours to ask (default: every seated human) |
-| `wait` | null or integer | seconds of silence that settle it (default: the pad's setting, 15; 0 waits for every answer) |
+| `wait` | null or integer | seconds of silence that settle it (default: the pad's setting, 15, or 30 for yesno and pads; 0 waits for every answer) |
 
 ### `cancel_round`
 
 Close the open ask_table round without a result (the question no longer matters, or players answered in chat).
 
 No parameters.
-
-### `player_pads`
-
-Optional: place a small Yes / No / Respond pad above each seated human's mat, or remove them all. Chat answers work without them; only on request.
-
-| Parameter | Type | Description |
-|---|---|---|
-| `remove` | boolean | true removes every player pad instead |
 
 ### `claim_seat`
 
@@ -89,15 +82,21 @@ Ask to sit at a colour. A human must press Yes on the pad before it takes effect
 |---|---|---|
 | `color` (required) | string | a seat colour the table has (White, Red, Yellow, Green, Blue, Purple...) - must be unseated |
 
+### `table_layout`
+
+Diagnostic: where things sit around your seat in mat terms (along = the mat's forward axis, right = its right axis, from its centre): every non-card object within reach with its name, scale, script functions and buttons, the cards there, your life tracker and the Winston spots. For fitting the pad to a table; not for play.
+
+No parameters.
+
 ## Playbook, modes and decks
 
 ### `playbook`
 
-How to play at this table: hard rules, game flow, your turn, other players' turns, tool habits. Read it before the first game if your client did not already load PLAYBOOK.md; part=rules gives the Commander rules guide.
+How to play at this table: hard rules, game flow, your turn, other players' turns, tool habits. Read it before the first game if your client did not already load PLAYBOOK.md; part=rules gives the Commander rules guide, part=draft how to draft.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `part` | string | playbook (default: how to play at this table) \| rules (the Commander rules guide and its opponent-turn checklists) \| all |
+| `part` | string | playbook (default: how to play at this table) \| rules (the Commander rules guide and its opponent-turn checklists) \| draft (drafting and limited games) \| all |
 
 ### `list_modes`
 
@@ -107,7 +106,7 @@ No parameters.
 
 ### `mode_rules`
 
-The rules for a play mode: who to target, when knockouts are allowed, what to remove, what deck to bring, plus the new-player rules that apply in every mode. Read it before choosing a deck and whenever ev=mode reports a change.
+The rules for a play mode: who to target, when knockouts are allowed, what to remove, what deck to bring, plus the new-player rules that apply in every mode. Read it before choosing a deck and whenever ev=mode reports a change. With no mode it reads the table live, so it can be ahead of [mode] events still queued when the mode changes fast.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -150,19 +149,21 @@ Start your turn in one call: untap everything, draw 1 (unless skip_draw), then r
 
 ### `cast`
 
-Cast a spell in one call: tap the mana, announce it, put it on the stack, give the table a quiet window to respond (they drop a card on your board or say 'wait'), then resolve it onto your battlefield or into the graveyard. Returns 'resolved' (carry out its effect now if it has one) or the response, with the spell left on the stack for you to finish. Lands use play.
+Cast a spell in one call: tap the mana, announce it, put it on the stack, give the table a quiet window to respond (they drop a card on your board or say 'wait'), then resolve it onto your battlefield or into the graveyard. Returns 'resolved' (carry out its effect now if it has one) or the response, with the spell left on the stack for you to finish. Lands use play. In response to another player's spell, pass respond_to (and counters=true for a counterspell).
 
 | Parameter | Type | Description |
 |---|---|---|
 | `guid` (required) | string | the spell: a card in your hand or command zone |
+| `counters` | boolean | with respond_to: your spell counters theirs; once yours resolves, its owner gets Countered / Not countered buttons on their card |
 | `note` | string | targets or modes, e.g. 'targeting White's Arahbo' |
-| `tap` | null or array | your mana sources to tap for it |
+| `respond_to` | string | the guid from a [play] line: you cast this in response to that player's spell (announced loudly, always with a window) |
+| `tap` | null or array | your mana sources to tap for it; a Treasure (or another source that sacrifices itself for mana) is sacrificed, and a counted token card loses one |
 | `to` | string | where it goes when it resolves: creature \| other \| graveyard (default: by type, instants and sorceries to the graveyard) |
-| `window` | null or integer | leave out: the server holds Game Changers, mana value 4+, spells that affect other players and your commander for 8 s, and resolves the rest at once |
+| `window` | null or integer | leave out (the server picks: 30 s with decision pads for heavy hitters, 8 s for spells that matter, 0 for the rest) |
 
 ### `draw`
 
-Draw n cards for a card effect. Not for your turn's draw (begin_turn does it) or your opening hand (import_deck deals it). Returns the hand.
+Draw n cards for a card effect. Not for your turn's draw (begin_turn does it) or your opening hand (import_deck deals it). Returns the new cards and the rest of your hand by name.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -183,20 +184,23 @@ No parameters.
 
 ### `play`
 
-Put a card from your hand or command zone onto your battlefield (land/creature/other row) or onto the stack spot. Say what you're doing first.
+Put a card from your hand or command zone onto your battlefield (land/creature/other row) or onto the stack spot. Spells go through cast; this is for lands and putting cards into play.
 
 | Parameter | Type | Description |
 |---|---|---|
 | `guid` (required) | string | card guid from my_hand or table_state (command zone) |
-| `row` | string | land \| creature \| other \| stack (default other). Use stack for instants/sorceries and anything that should be announced before it resolves. |
+| `row` | string | land \| creature \| other \| stack (default other) |
+| `say` | string | one short chat line to say first (saves a say call) |
 
 ### `tap`
 
-Tap permanents on your battlefield (mana, attackers, abilities).
+Tap permanents on your battlefield (mana, attackers, abilities). mana=true sacrifices Treasures and the like.
 
 | Parameter | Type | Description |
 |---|---|---|
 | `guids` (required) | null or array | guids of permanents on your battlefield |
+| `mana` | boolean | they pay for mana: a Treasure or other sacrifice-for-mana source is sacrificed instead of tapped (cast tap= does this for you) |
+| `say` | string | one short chat line to say first (saves a say call) |
 
 ### `untap`
 
@@ -206,6 +210,7 @@ Untap your permanents - specific guids, or all=true for the untap step.
 |---|---|---|
 | `all` | boolean | untap everything on your battlefield (untap step) |
 | `guids` | null or array | specific permanents to untap |
+| `say` | string | one short chat line to say first (saves a say call) |
 
 ### `flip`
 
@@ -214,6 +219,7 @@ Flip one of your cards (transform DFCs, morph face-up, etc.).
 | Parameter | Type | Description |
 |---|---|---|
 | `guid` (required) | string |  |
+| `say` | string | one short chat line to say first (saves a say call) |
 
 ### `move`
 
@@ -221,20 +227,22 @@ Move one of your objects between zones: resolve a spell from the stack to the gr
 
 | Parameter | Type | Description |
 |---|---|---|
-| `guid` (required) | string | one of your objects (hand, battlefield, graveyard, exile, command zone, or a library card from look) |
 | `to` (required) | string | graveyard \| exile \| command \| hand \| stack \| battlefield \| library_top \| library_bottom |
+| `guid` | string | one of your objects (hand, battlefield, graveyard, exile, command zone, or a library card from look) |
+| `guids` | null or array | or several, moved in this order (to library_top: the last one ends on top) |
 | `row` | string | when to=battlefield: land \| creature \| other |
+| `say` | string | one short chat line to say first (saves a say call) |
 
 ### `attack`
 
-Declare attackers: taps them, announces the attack loudly and waits for the defender's blocks in chat (silence = no blocks). Returns what they said; then work out damage, say the numbers and let them move their tracker.
+Declare attackers: taps them, announces the attack loudly and waits for the defender's blocks in chat (silence = no blocks). Returns what they said; then work out damage, say the numbers in one line and let them move their tracker.
 
 | Parameter | Type | Description |
 |---|---|---|
 | `guids` (required) | null or array | attacking creatures (your battlefield) |
 | `target` (required) | string | defending colour, or a planeswalker/battle name |
 | `note` | string | anything extra to announce (triggers, pump, etc.) |
-| `wait` | null or integer | seconds to wait for the defender to declare blocks (default 20) |
+| `wait` | null or integer | seconds to wait for the defender to declare blocks (default 45; humans need time to work out blocks) |
 
 ### `end_turn`
 
@@ -261,6 +269,7 @@ Search your OWN library for cards matching a query (tutors, ramp like Cultivate/
 | Parameter | Type | Description |
 |---|---|---|
 | `query` (required) | string | case-insensitive text matched against card name and type line, e.g. 'forest', 'basic land', 'Eternal Witness' |
+| `basic` | boolean | only basic lands: set it for 'search for a basic land' effects (Terramorphic Expanse, Cultivate, Rampant Growth), or 'forest' also matches Breeding Pool |
 | `desc` | boolean | also match the oracle text |
 | `n` | integer | how many matching cards to take (default 1) |
 | `no_shuffle` | boolean | skip the shuffle afterwards (almost never) |
@@ -285,6 +294,7 @@ Reveal cards (from hand, library via look, etc.) to the whole table: announced i
 | Parameter | Type | Description |
 |---|---|---|
 | `guids` (required) | null or array | guids of permanents on your battlefield |
+| `say` | string | one short chat line to say first (saves a say call) |
 
 ## Counters, tokens and life
 
@@ -296,7 +306,7 @@ Set ON-CARD state on one of your cards the way the table's right-click menu does
 |---|---|---|
 | `guid` (required) | string | one of your cards on the battlefield |
 | `counters` | integer | delta of generic named counters (charge, oil, time...) |
-| `keywords` | null or array | keyword icons to add: flying, first strike, double strike, deathtouch, lifelink, trample, vigilance, menace, reach, haste, hexproof, indestructible, defender, frozen, monstrous, stun, exert, renowned, suspend |
+| `keywords` | null or array | keyword icons to add (flying, trample, haste, hexproof, indestructible...; also frozen, monstrous, stun, exert) |
 | `loyalty` | integer | delta of loyalty on a planeswalker |
 | `note` | null or string | set the card's notepad text (empty string clears) |
 | `phased` | null or boolean | true = phased out marker on, false = off |
@@ -320,13 +330,17 @@ Drop counters/keyword tokens from the table's bags onto one of your permanents. 
 
 ### `spawn_token`
 
-Create token cards on your battlefield: found on Scryfall, built by the deck importer.
+Create tokens on your battlefield (found on Scryfall, built by the deck importer). For several alike, pass count: one card plus a counter. power/toughness fix a token whose Scryfall card has other stats; note labels it. A token for another player lands on your mat: ask them to drag it over.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `query` (required) | string | Scryfall SEARCH SYNTAX for the token (t:token is added for you). Use an EXACT name with ! plus -is:dfc so a double-faced or similarly named token is not picked: '!Treasure -is:dfc', '!Food -is:dfc', '!Beast pow=3 tou=3 c:g -is:dfc', '!Plant pow=0 tou=1 -is:dfc'. Plain words like 'Beast 3/3' do not work. |
-| `n` | integer | how many copies (default 1) |
-| `row` | string | creature \| other (default creature) |
+| `query` (required) | string | the token's exact name ('Treasure', 'Food', 'Clue') or Scryfall SEARCH SYNTAX (t:token is added for you) when several share a name: '!Beast pow=3 tou=3 c:g -is:dfc', '!Plant pow=0 tou=1 -is:dfc'. A plain name is searched as that exact name. Plain words like 'Beast 3/3' do not work. |
+| `count` | integer | the usual way: ONE card that stands for this many tokens, with the count on its counter and in its note |
+| `n` | integer | how many separate cards (default 1): only for tokens that differ |
+| `note` | string | notepad text for the token, e.g. 'Hippo for Blue (Phelddagrif)' when it is a gift for another player |
+| `power` | null or integer | the token's real power when the card found differs (Phelddagrif's Hippo is a 1/1, Scryfall's Hippo a 3/3): the card is marked to show it |
+| `row` | string | creature \| other (default: creature for creature tokens, other for the rest) |
+| `toughness` | null or integer | the token's real toughness, as for power |
 
 ### `adjust_life`
 
@@ -370,6 +384,52 @@ NEW GAME: destroy all of your cards, tokens and counter tiles in your zones and 
 
 No parameters.
 
+## Drafting
+
+### `start_draft`
+
+Run a draft at the table: the pad builds the packs on the importer and deals them into every drafter's hand. Picks per pass follow the number of drafters (Winston for 2, pick-two for 3-4, booster for 5+) unless format says otherwise. Agree the set or cube with the table first and reset_board before it. Waits for the packs (up to 2 min) and returns your first pack or pile. playbook(part=draft) has how to draft.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `cube` | string | or: a CubeCobra cube id or link, or a URL to a plain list (one card per line) |
+| `format` | string | auto (default: Winston for 2 drafters, pick-two for 3-4, booster for 5 or more) \| booster \| pick_two \| winston |
+| `list` | string | or: the cube itself, one card per line ('2 Llanowar Elves' works) |
+| `pack_size` | integer | cards per pack (default 15) |
+| `packs` | integer | packs per drafter (default 3; Winston's stack holds twice that many packs' worth) |
+| `seats` | null or array | the drafting colours, if not every seated player (you are always in) |
+| `set` | string | a set code for set boosters, e.g. 'dsk' or 'mh3' (Scryfall's codes) |
+
+### `draft_view`
+
+The draft as you may see it: format, pack and pick, who the table waits on, the pack in your hand (or your Winston pile on your turn), and your pool with its colours and curve.
+
+No parameters.
+
+### `draft_pick`
+
+Make your draft pick. Booster and pick-two: guids from the [draft] pack. Winston: take=true or false. Picks go face-down to your pool on your mat; the next pack comes as a [draft] event (this waits up to 20 s for it).
+
+| Parameter | Type | Description |
+|---|---|---|
+| `guids` | null or array | booster and pick-two: the card(s) you take from the pack in your hand |
+| `take` | null or boolean | Winston: true takes the pile you are looking at, false passes it (it gets a card and you look at the next pile; passing the last pile takes the stack's top card) |
+
+### `draft_build`
+
+After the draft: your chosen pool cards plus basic lands become your library (shuffled), the rest your sideboard beside it, your life goes to 20 and your opening 7 is dealt. Limited decks are 40 cards or more, usually 17 lands.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `main` (required) | null or array | guids of the pool cards for your main deck (draft_view lists them); the rest becomes your sideboard |
+| `basics` | object | basic lands to add, e.g. {"Forest": 9, "Mountain": 8} |
+
+### `cancel_draft`
+
+Call the draft off (the table agreed to stop): the pad stops dealing and passing, and its cards stay where they are.
+
+No parameters.
+
 ## Development only (-dev)
 
 ### `exec_lua`
@@ -379,4 +439,12 @@ DEV ONLY: run arbitrary Lua in TTS. Not available in play mode.
 | Parameter | Type | Description |
 |---|---|---|
 | `script` (required) | string | Lua to run in the Global context; must return a value |
+
+## Other
+
+### `pass`
+
+Let a spell the table is holding for you resolve: says 'no response, carry on' and lifts the hold at once (a hold also runs out by itself).
+
+No parameters.
 

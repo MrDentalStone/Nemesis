@@ -169,3 +169,30 @@ func beforeDraw(s *pad.Snapshot) []string {
 	}
 	return out
 }
+
+// Commander tax: {2} more for each earlier cast of that commander from the
+// command zone this game. The pad does not track it, so the server counts the
+// casts per card; a new import (new GUIDs) starts the count again.
+var cmdrCasts = struct {
+	sync.Mutex
+	m map[string]int
+}{m: map[string]int{}}
+
+// commanderTax records a cast and returns which cast from the command zone it
+// is and the tax it carries (0 for anything not cast from there).
+func commanderTax(guid, from string) (nth, tax int) {
+	if from != "command" || guid == "" {
+		return 0, 0
+	}
+	cmdrCasts.Lock()
+	defer cmdrCasts.Unlock()
+	cmdrCasts.m[guid]++
+	nth = cmdrCasts.m[guid]
+	return nth, 2 * (nth - 1)
+}
+
+func resetCommanderTax() {
+	cmdrCasts.Lock()
+	cmdrCasts.m = map[string]int{}
+	cmdrCasts.Unlock()
+}

@@ -1,7 +1,6 @@
 package mcpserver
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -28,20 +27,29 @@ func (e Event) Bool(k string) bool  { v, _ := e[k].(bool); return v }
 // to know whether a play needs an answer. note is a catch-up remark for the
 // caller to show ("3 events recovered").
 func NextEvents(ctx context.Context, d Deps, timeout time.Duration) (note string, evs []Event) {
-	if n, err := d.Pad.Drain(ctx); err != nil && !errors.Is(err, pad.ErrNoPad) {
-		note = "(catch-up failed: " + err.Error() + ")"
-	} else if n > 0 {
-		note = fmt.Sprintf("(%d events recovered from the pad buffer)", n)
+	return nextEvents(ctx, d, timeout, true, 300*time.Millisecond)
+}
+
+// nextEvents is NextEvents with the catch-up drain optional (a waiting tool
+// drains once, not on every wake) and the settle window after the first
+// event set by the caller (a waiting tool wants its hit at once).
+func nextEvents(ctx context.Context, d Deps, timeout time.Duration, drain bool, settle time.Duration) (note string, evs []Event) {
+	if drain {
+		if n, err := d.Pad.Drain(ctx); err != nil && !errors.Is(err, pad.ErrNoPad) {
+			note = "(catch-up failed: " + err.Error() + ")"
+		} else if n > 0 {
+			note = fmt.Sprintf("(%d events recovered from the pad buffer)", n)
+		}
 	}
-	raws := collectEvents(ctx, d.TTS, timeout)
+	raws := collectEvents(ctx, d.TTS, timeout, settle)
 	plays, myTurn := false, false
 	for _, raw := range raws {
-		if bytes.Contains(raw, []byte(`"ev":"pad"`)) {
-			reconfigure() // a fresh or reloaded pad: send name and modes again
-		}
 		var e Event
 		if json.Unmarshal(raw, &e) != nil {
 			continue
+		}
+		if e.Str("ev") == "pad" {
+			reconfigure() // a fresh or reloaded pad: send name and modes again
 		}
 		delete(e, "t")
 		delete(e, "seq")
@@ -57,12 +65,29 @@ func NextEvents(ctx context.Context, d Deps, timeout time.Duration) (note string
 		if e.Str("ev") == "turn" && e.Bool("claude") {
 			myTurn = true
 		}
+		if e.Str("ev") == "draft" && e.Str("cards") != "" {
+			recallCosts(ctx, d, parseCardList(e.Str("cards"))) // a restart mid-draft forgot them
+		}
 		evs = append(evs, e)
 	}
 	if plays || myTurn {
-		w, err := ResponseWindow(ctx, d)
+		// one read of your hand and battlefield per batch, and none for a
+		// play the server already looked at as it arrived (interrupt.go)
+		var cached *Window
+		var cachedErr error
+		window := func() (Window, error) {
+			if cached == nil && cachedErr == nil {
+				w, err := ResponseWindow(ctx, d)
+				cached, cachedErr = &w, err
+			}
+			return *cached, cachedErr
+		}
 		for _, e := range evs {
-			if e.Str("ev") == "turn" && e.Bool("claude") && err == nil && w.EmptyStack().Any() {
+			if e.Str("ev") == "turn" && e.Bool("claude") {
+				w, err := window()
+				if err != nil || !w.EmptyStack().Any() {
+					continue
+				}
 				// the pad hands the turn over straight from the last player's
 				// end step: this is the moment for end-step instants, before
 				// begin_turn untaps
@@ -71,12 +96,22 @@ func NextEvents(ctx context.Context, d Deps, timeout time.Duration) (note string
 			if e.Str("ev") != "play" {
 				continue
 			}
+			if isLandPlay(e) {
+				e["canRespond"] = false
+				continue
+			}
+			var w Window
+			var err error
+			if pi := playFor(e.Str("guid")); pi != nil && pi.ok && e.Str("to") != "your_board" {
+				w = pi.w
+				e["held"] = pi.held
+			} else {
+				w, err = window()
+			}
 			switch {
 			case err != nil:
 				e["window"] = "unknown (" + err.Error() + ")"
 				e["canRespond"] = true
-			case isLandPlay(e):
-				e["canRespond"] = false
 			default:
 				e["window"] = w.String()
 				e["canRespond"] = w.Any()
@@ -111,7 +146,7 @@ func Render(e Event) string {
 	case "chat":
 		return fmt.Sprintf("[chat] %s: %q", who(), s("text"))
 	case "attack":
-		return fmt.Sprintf("[attack] %s tapped on their turn: %s", who(), strings.Join(attackers(e), ", "))
+		return renderAttack(e, who())
 	case "play":
 		c := cards.Parse(s("name"), s("desc"))
 		line := fmt.Sprintf("[play] %s: %s", who(), cardLine(c))
@@ -122,17 +157,29 @@ func Render(e Event) string {
 			}
 		} else {
 			line += fmt.Sprintf(" (%s -> %s)", s("from"), s("to"))
+			if o := s("onto"); o != "" {
+				line += fmt.Sprintf(", dropped on %s's board: %s cast it, aimed at %s", o, s("color"), o)
+			}
 		}
 		if e.Bool("faceDown") {
 			line += " face-down"
 		}
 		if c.Oracle != "" && !isLandPlay(e) {
-			line += " | " + oneLineText(c.Oracle, playTextMax)
+			n := playTextMax
+			if !e.Bool("canRespond") && s("to") != "your_board" {
+				n = quietPlayTextMax // parse_card(guid) has the rest
+			}
+			line += " | " + oneLineText(c.Oracle, n)
 		}
 		switch {
 		case isLandPlay(e):
+		case e.Bool("held"):
+			line += fmt.Sprintf(" || THE TABLE IS HELD FOR YOU, answer now: you could respond: %s (cast with respond_to=%s), or pass", s("window"), s("guid"))
 		case e.Bool("canRespond"):
 			line += " || you could respond: " + s("window")
+			if g := s("guid"); g != "" {
+				line += " (respond_to=" + g + ")"
+			}
 		default:
 			line += " || nothing to respond with"
 		}
@@ -172,10 +219,15 @@ func Render(e Event) string {
 			line += " after silence"
 		}
 		return line
+	case "round_pause":
+		if e.Bool("paused") {
+			return fmt.Sprintf("[round] %s pressed Wait on their decision pad: the countdown is paused", s("color"))
+		}
+		return fmt.Sprintf("[round] %s let the countdown run again (%v s left)", s("color"), e["left"])
 	case "button":
 		where := "admin pad"
-		if s("pad") == "player" {
-			where = s("color") + "'s player pad"
+		if s("pad") == "decision" {
+			where = s("color") + "'s decision pad"
 		}
 		return fmt.Sprintf("[button] %s on the %s (%s)", s("id"), where, or(s("name"), s("color")))
 	case "zone":
@@ -185,6 +237,16 @@ func Render(e Event) string {
 		}
 		return fmt.Sprintf("[zone] your %s %s %s", s("name"), map[string]string{"enter": "entered", "leave": "left"}[s("dir")],
 			strings.TrimSuffix(s("zone"), "Zone"))
+	case "hold":
+		return fmt.Sprintf("[hold] your hold on %s ran out (%v s) and the table carried on: it resolved", s("name"), e["secs"])
+	case "countered":
+		switch s("result") {
+		case "accepted":
+			return fmt.Sprintf("[countered] %s's %s went to their graveyard", s("color"), s("name"))
+		case "refused":
+			return fmt.Sprintf("[countered] %s pressed Not countered on %s: ask what answers your counter", s("color"), s("name"))
+		}
+		return fmt.Sprintf("[countered] nobody settled %s's %s: remind them in chat", s("color"), s("name"))
 	case "log":
 		return "[log] " + s("text")
 	case "mode":
@@ -200,9 +262,32 @@ func Render(e Event) string {
 		return "[import] deck import FAILED: " + s("error")
 	case "pad":
 		return "[pad] the Nemesis pad " + or(s("what"), "changed")
+	case "draft":
+		return renderDraftEvent(e)
 	}
 	raw, _ := json.Marshal(e)
 	return string(raw)
+}
+
+// renderAttack: the attack pad decides whether tapped creatures are an
+// attack on you. Without a press (and with other opponents to hit) it is
+// someone else's fight; minorEvent keeps that line from waking you.
+func renderAttack(e Event, who string) string {
+	list := strings.Join(attackers(e), ", ")
+	switch {
+	case e.Bool("takenBack"):
+		return fmt.Sprintf("[attack] the attack pad was pressed again: %s is NOT attacking you after all", e.Str("color"))
+	case e.Bool("noTaps"):
+		return fmt.Sprintf("[attack] %s pressed your attack pad: they are ATTACKING YOU, but no creature of theirs tapped (vigilance?). "+
+			"table_state to see their board, then say your blocks", who)
+	case e.Bool("pressed"), e.Bool("late"):
+		return fmt.Sprintf("[attack] %s is ATTACKING YOU (attack pad) with: %s. Check each attacker, then say your blocks", who, list)
+	case e.Bool("onMe"):
+		return fmt.Sprintf("[attack] %s is ATTACKING YOU (you are their only opponent) with: %s. Check each attacker, then say your blocks", who, list)
+	case e["onMe"] != nil:
+		return fmt.Sprintf("[attack] %s tapped %s, not at you (your attack pad is dark): stay quiet", who, list)
+	}
+	return fmt.Sprintf("[attack] %s tapped on their turn: %s", who, list)
 }
 
 // attackers lists the creatures in an ev=attack ("Arahbo (2/2)").
@@ -229,12 +314,12 @@ func attackers(e Event) []string {
 // events are consumed here and nobody else will see them.
 func Await(ctx context.Context, d Deps, timeout time.Duration, done func(Event) bool) (hit Event, seen []Event) {
 	deadline := time.Now().Add(timeout)
-	for hit == nil {
+	for first := true; hit == nil; first = false {
 		left := time.Until(deadline)
 		if left <= 0 || ctx.Err() != nil {
 			return nil, seen
 		}
-		_, evs := NextEvents(ctx, d, left)
+		_, evs := nextEvents(ctx, d, left, first, 0)
 		for _, e := range evs {
 			if hit == nil && done(e) {
 				hit = e
@@ -280,8 +365,65 @@ func cardLine(c cards.Card) string {
 }
 
 // playTextMax keeps a [play] line readable but long enough for wordy cards
-// (Itazura, Lingering Wick ran past the old 220).
-const playTextMax = 700
+// (Itazura, Lingering Wick ran past the old 220). A play you cannot answer
+// gets less: parse_card reads the rest when it matters.
+const (
+	playTextMax      = 700
+	quietPlayTextMax = 300
+)
+
+// minorEvent: news that does not need you now. wait_for_event keeps waiting
+// and sums these up with the next event that does.
+func minorEvent(e Event) bool {
+	switch e.Str("ev") {
+	case "play":
+		return isLandPlay(e) && e.Str("to") != "your_board"
+	case "turn":
+		return !e.Bool("claude") && !e.Bool("tookBack")
+	case "attack":
+		// tapped creatures with the attack pad dark: not your fight
+		return e["onMe"] != nil && !e.Bool("onMe") && !e.Bool("takenBack")
+	case "round_pause":
+		return true
+	case "log":
+		// the table's own chatter (land counters, the importer's progress);
+		// Lua errors and anything about life, damage or the game still wake you
+		return e.Str("kind") != "error" && !reLogNews.MatchString(e.Str("text"))
+	}
+	return false
+}
+
+// summaryMax caps the Meanwhile line: a burst of table chatter is not news.
+const summaryMax = 6
+
+var (
+	reLogNews = regexp.MustCompile(`(?i)life|damage|poison|scoop|concede|turn|nemesis|error`)
+	reBBCode  = regexp.MustCompile(`\[(?:[0-9A-Fa-f]{6}|-|/?[bius])\]`)
+)
+
+// summarise is one line for the minor events: "Meanwhile: Blue played
+// Forest; Red's turn".
+func summarise(evs []Event) string {
+	var parts []string
+	for _, e := range evs {
+		switch e.Str("ev") {
+		case "play":
+			parts = append(parts, e.Str("color")+" played "+cards.Parse(e.Str("name"), "").Name)
+		case "turn":
+			parts = append(parts, e.Str("color")+"'s turn")
+		case "attack":
+			parts = append(parts, fmt.Sprintf("%s attacked someone else with %d", e.Str("color"), len(attackers(e))))
+		case "round_pause":
+			parts = append(parts, e.Str("color")+" paused a decision pad")
+		case "log":
+			parts = append(parts, "log "+oneLineText(reBBCode.ReplaceAllString(e.Str("text"), ""), 60))
+		}
+	}
+	if len(parts) > summaryMax {
+		parts = append(parts[:summaryMax], fmt.Sprintf("and %d more", len(parts)-summaryMax))
+	}
+	return "Meanwhile: " + strings.Join(parts, "; ")
+}
 
 func oneLineText(s string, n int) string {
 	s = strings.Join(strings.Fields(s), " ")
@@ -300,6 +442,9 @@ type Window struct {
 	// OnSpell marks the options that only answer a spell (Counterspell,
 	// Twincast): useless with an empty stack, as in an end step.
 	OnSpell []bool
+	// Targets is, for an OnSpell option, what it may target ("noncreature
+	// spell", "instant or sorcery spell"); "spell" for any.
+	Targets []string
 }
 
 func (w Window) Any() bool { return len(w.Options) > 0 }
@@ -324,7 +469,37 @@ func (w Window) EmptyStack() Window {
 	return out
 }
 
-var reOnSpell = regexp.MustCompile(`(?i)^(counter|copy) target [^.]*spell`)
+var reOnSpell = regexp.MustCompile(`(?i)^(?:counter|copy) target ([^.]*?spell)`)
+
+var cardTypes = []string{"creature", "artifact", "enchantment", "instant", "sorcery", "planeswalker", "battle"}
+
+// canTarget says whether an answer restricted to target ("noncreature
+// spell", "instant or sorcery spell", "creature spell") can take a spell of
+// typeLine. Words it does not know (multicoloured, mana value) count as yes.
+func canTarget(target, typeLine string) bool {
+	t, tl := strings.ToLower(target), strings.ToLower(typeLine)
+	var want []string
+	for _, ct := range cardTypes {
+		if strings.Contains(t, "non"+ct) {
+			if strings.Contains(tl, ct) {
+				return false
+			}
+			continue
+		}
+		if strings.Contains(t, ct) {
+			want = append(want, ct)
+		}
+	}
+	if len(want) == 0 {
+		return true
+	}
+	for _, ct := range want {
+		if strings.Contains(tl, ct) {
+			return true
+		}
+	}
+	return false
+}
 
 var (
 	reCostSym  = regexp.MustCompile(`\{([^}]+)\}`)
@@ -337,25 +512,16 @@ var (
 // waking you: a card it cannot cost is listed.
 func ResponseWindow(ctx context.Context, d Deps) (Window, error) {
 	var w Window
-	snap, err := d.Pad.Snapshot(ctx)
+	field, hand, err := windowRead(ctx, d)
 	if err != nil {
 		return w, err
-	}
-	var me *pad.Seat
-	for i := range snap.Seats {
-		if snap.Seats[i].IsClaude {
-			me = &snap.Seats[i]
-		}
-	}
-	if me == nil {
-		return w, errors.New("no seat")
 	}
 	type ability struct {
 		name, cost string
 		n          int
 	}
 	var abilities []ability
-	for _, p := range me.Battlefield {
+	for _, p := range field {
 		if p.Type != "Card" || p.FaceDown {
 			continue
 		}
@@ -383,11 +549,7 @@ func ResponseWindow(ctx context.Context, d Deps) (Window, error) {
 			w.Mana++ // one per source: enough to tell whether a response is affordable
 		}
 	}
-	h, err := d.Pad.Hand(ctx)
-	if err != nil {
-		return w, err
-	}
-	for _, rc := range h.Cards {
+	for _, rc := range hand {
 		if rc.Zone == "tokens" {
 			continue
 		}
@@ -402,16 +564,52 @@ func ResponseWindow(ctx context.Context, d Deps) (Window, error) {
 		}
 		if cost <= w.Mana || reFreeCast.MatchString(c.Oracle) {
 			w.Options = append(w.Options, fmt.Sprintf("%s (%s, mv %d)", c.Name, kindOf(c), cost))
-			w.OnSpell = append(w.OnSpell, reOnSpell.MatchString(c.Oracle))
+			m := reOnSpell.FindStringSubmatch(c.Oracle)
+			w.OnSpell = append(w.OnSpell, m != nil)
+			if m != nil {
+				w.Targets = append(w.Targets, m[1])
+			} else {
+				w.Targets = append(w.Targets, "")
+			}
 		}
 	}
 	for _, a := range abilities {
 		if a.n <= w.Mana {
 			w.Options = append(w.Options, fmt.Sprintf("%s ability %s", a.name, a.cost))
 			w.OnSpell = append(w.OnSpell, false)
+			w.Targets = append(w.Targets, "")
 		}
 	}
 	return w, nil
+}
+
+// windowRead is your battlefield and hand: one light pad call, or a full
+// snapshot and the hand from a pad older than v1.2.0.
+func windowRead(ctx context.Context, d Deps) ([]pad.Permanent, []pad.RawCard, error) {
+	if r, err := d.Pad.Window(ctx); err == nil {
+		return r.Battlefield, r.Cards, nil
+	} else if !strings.Contains(err.Error(), "unknown op") {
+		return nil, nil, err
+	}
+	snap, err := d.Pad.Snapshot(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	var field []pad.Permanent
+	found := false
+	for _, s := range snap.Seats {
+		if s.IsClaude {
+			field, found = s.Battlefield, true
+		}
+	}
+	if !found {
+		return nil, nil, errors.New("no seat")
+	}
+	h, err := d.Pad.Hand(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return field, h.Cards, nil
 }
 
 func kindOf(c cards.Card) string {
@@ -437,4 +635,40 @@ func manaIn(cost string) int {
 		n++
 	}
 	return n
+}
+
+// awaitRound waits for round id to settle. A Wait press on a decision pad
+// stops the pad's countdown, so the deadline follows it: while anyone holds
+// it paused the wait runs on up to maxWait in all, and once it resumes, for
+// the seconds the pad has left. paused reports a round still held at the end.
+func awaitRound(ctx context.Context, d Deps, id int, limit, maxWait time.Duration) (hit Event, seen []Event, paused bool) {
+	start := time.Now()
+	deadline := start.Add(limit)
+	for {
+		left := time.Until(deadline)
+		if left <= 0 {
+			return nil, seen, paused
+		}
+		var got []Event
+		hit, got = Await(ctx, d, left, func(e Event) bool {
+			n, _ := e["id"].(float64)
+			ev := e.Str("ev")
+			return (ev == "round" || ev == "round_pause") && int(n) == id
+		})
+		seen = append(seen, got...)
+		if hit == nil {
+			return nil, seen, paused
+		}
+		if hit.Str("ev") == "round" {
+			return hit, seen, false
+		}
+		seen = append(seen, hit)
+		paused = hit.Bool("anyPaused")
+		if paused {
+			deadline = start.Add(maxWait)
+		} else {
+			secs, _ := hit["left"].(float64)
+			deadline = time.Now().Add(time.Duration(secs+5) * time.Second)
+		}
+	}
 }

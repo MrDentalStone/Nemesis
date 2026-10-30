@@ -12,7 +12,7 @@
 -- and nothing here is reachable from chat.
 
 nemesisPad = true          -- marker the Go side scans for
-NEMESIS_VERSION = 'v1.1.0'
+NEMESIS_VERSION = 'v1.4.0'
 
 -- the deck importer the MTG tables ship with; nemesis-mcp passes its own URL
 local IMPORTER = 'https://importer.rikrassen.com'
@@ -44,6 +44,12 @@ function onLoad(saved)
       if type(s.name) == 'string' and s.name ~= '' then NAME = s.name end
       if type(s.modes) == 'table' and #s.modes > 0 then MODES = s.modes end
       if type(s.roundWait) == 'number' then state.roundWait = s.roundWait end
+      if s.decisionPads == false then state.decisionPads = false end
+      if type(s.draft) == 'table' then
+        state.draft = s.draft
+        -- Time.time starts again at load
+        for _, h in pairs(state.draft.hands or {}) do h.since = 0 end
+      end
     end
   end
   pcall(refreshColors)
@@ -52,12 +58,32 @@ function onLoad(saved)
   buildControls()
   emit({ ev = 'pad', what = 'loaded', seat = state.seat })
   Wait.time(function() pcall(seedField) end, 1)
-  Wait.time(function() pcall(pollTaps) end, 1.5, -1)
+  -- rounds do not survive a reload, so neither do their pads
+  Wait.time(function()
+    if stale() then return end
+    pcall(removeDecisionPads); pcall(ensureAttackPad)
+    -- a human mid-Winston-pick gets their pad back
+    local dr = state.draft
+    if dr and dr.format == 'winston' and dr.phase == 'picking' and dr.view and dr.turn ~= state.seat then
+      dr.pad = nil
+      Wait.time(function() pcall(function() showWinstonPad(dr.turn, dr.pile, #dr.view, wNextPileFor(dr.pile + 1) == nil) end) end, 1)
+    end
+  end, 2)
+  local tapTimer
+  local tick = 0
+  tapTimer = Wait.time(function()
+    if stale() then Wait.stop(tapTimer) return end
+    pcall(pollTaps)
+    pcall(pollDraft)
+    tick = tick + 1
+    if tick % 2 == 0 then pcall(pollMana) end
+  end, 1.5, -1)
 end
 
 function onSave()
   return JSON.encode({ seat = state.seat, stopped = state.stopped, claudeTurn = state.claudeTurn == true, cmdr = state.cmdr,
-    mode = state.mode, newPlayers = state.newPlayers, name = NAME, modes = MODES, roundWait = state.roundWait })
+    mode = state.mode, newPlayers = state.newPlayers, name = NAME, modes = MODES, roundWait = state.roundWait, draft = state.draft,
+    decisionPads = state.decisionPads })
 end
 
 ---------------------------------------------------------------------------
@@ -69,12 +95,30 @@ end
 -- between sessions, the CLI between calls) can fetch what it missed with the
 -- events op instead of losing chat and button presses.
 ops = ops or {}
+-- The epoch only ever grows, even for two loads in the same second (the pad
+-- updating itself), so the server can tell an older load's events apart.
 state.evEpoch = math.floor(os.time())
+pcall(function()
+  local last = tonumber(Global.getVar('nemesisPadEpoch')) or 0
+  if state.evEpoch <= last then state.evEpoch = last + 1 end
+  Global.setVar('nemesisPadEpoch', state.evEpoch)
+end)
 state.evSeq = 0
 state.evBuf = {}
 local EV_RING = 300
 
+-- A script replaced in place (setLuaScript + reload, the pad updating itself)
+-- can leave its repeating timers running in the old instance, which then
+-- emit stale duplicates (every attack seen once per old load). Each load
+-- claims the newest epoch in Global; an instance whose epoch is not the
+-- newest is stale and goes quiet.
+function stale()
+  local ok, cur = pcall(function() return tonumber(Global.getVar('nemesisPadEpoch')) end)
+  return ok and cur ~= nil and cur ~= state.evEpoch
+end
+
 function emit(ev)
+  if stale() then return end
   ev.t = Time.time
   state.evSeq = state.evSeq + 1
   ev.seq = state.evSeq
@@ -99,6 +143,7 @@ end
 function onChat(message, player)
   emit({ ev = 'chat', color = player.color, name = player.steam_name, text = message })
   chatAnswer(player.color, message)
+  draftChat(player.color, message)
 end
 
 -- Turns. TTS's turn system bounces the marker straight off a colour with no
@@ -117,7 +162,7 @@ function seatSkipped(color)
   local ok, out = pcall(function()
     local d = seatData(color)
     if d == nil or d.playmat == nil then return false end
-    for _, o in ipairs(d.playmat.getObjects()) do
+    for _, o in ipairs(zoneObjects(d.playmat)) do
       if string.sub(o.getName(), 1, 12) == 'Turn Skipper' then return true end
     end
     return false
@@ -140,6 +185,7 @@ function startClaudeTurn(prev)
   if state.seat == nil then return end
   state.claudeTurn = true
   Turns.enable = false
+  pcall(clearAttackCall)
   broadcastToAll("[Nemesis] " .. NAME .. "'s turn (" .. state.seat .. ")", Color.fromString(state.seat))
   setStatus(NAME .. "'s turn")
   -- the first turn after reset_board: the table may not have settled who
@@ -167,6 +213,8 @@ function onPlayerTurn(player, previous)
   -- (which startClaudeTurn does), so there is nothing to intercept then
   if player == nil then return end
   pcall(refreshColors)
+  pcall(clearAttackCall)
+  if state.draft and state.draft.phase == 'done' then endDraft() end -- the first game turn after a draft
   local prev = previous and previous.color or nil
   if state.justEnded and Time.time - state.justEnded < 3 then
     -- our own end_turn re-enabled the marker. TTS first lands it on a stale
@@ -240,7 +288,22 @@ local function stampDealt(object, key)
   end
 end
 
+-- A locked card or pile is a table script's prop, not a card in play: MTG
+-- Lotus Helper (the (S) table's 2026-10 update) floats locked preview basics
+-- in front of every fetch land (Evolving Wilds: a Forest, Mountain and Island
+-- in the deck's colours) and deletes them when the land leaves. Players'
+-- cards are never locked.
+function isTableProp(obj)
+  if obj == nil or (obj.type ~= 'Card' and obj.type ~= 'Deck') then return false end
+  local ok, locked = pcall(function() return obj.getLock() end)
+  return ok and locked == true
+end
+
 local function noteZone(object, dir, key)
+  -- Nemesis's own objects (decision and attack pads, the set-up tile) are no news
+  local okp, ours = pcall(function() return object.getVar('nemesisDecisionPad') or object.getVar('nemesisAttackPad') or object.getVar('nemesisSetupTile') end)
+  if okp and ours then return end
+  if isTableProp(object) then return end
   local g = object.getGUID()
   local m = state.zoneMoves[g]
   if m == nil then
@@ -249,6 +312,7 @@ local function noteZone(object, dir, key)
     local function settle()
       state.zoneMoves[g] = nil
       if recentlyTouched(object) then return end
+      if isTableProp(object) then return end -- locked a moment after it spawned
       local final
       if object == nil or object.isDestroyed() then
         -- merged into a pile (a graveyard deck): TTS reports it leaving that
@@ -295,12 +359,15 @@ end
 
 function onObjectEnterZone(zone, object)
   if object == self then return end -- the pad itself resting on a mat
+  if draftQuiet() then return end -- picks and packs are not plays
   if zone and zone.type == 'Hand' then state.fieldOf[object.getGUID()] = nil end
   local seat, key = zoneOwner(zone)
   if seat == nil then return end
   if key == 'graveyard' or key == 'exileZone' or key == 'libraryZone' or key == 'commandZone' then
     state.fieldOf[object.getGUID()] = nil
   end
+  local cn = state.countered[object.getGUID()]
+  if cn and key == 'graveyard' and seat == cn.owner then counterSettled(object, seat, true, 'hand') end
   if seat == state.seat then
     stampDealt(object, key)
     local by = object.held_by_color
@@ -333,6 +400,7 @@ end
 
 function onObjectLeaveZone(zone, object)
   if object == self then return end -- the pad itself resting on a mat
+  if draftQuiet() then return end
   local seat, key = zoneOwner(zone)
   if seat == nil then
     -- a card leaving a human's hand: remember it, it may be on its way to
@@ -459,10 +527,12 @@ end
 state.lastLeft = {}   -- guid -> { seat, key, t }: where a card was last seen leaving
 state.playSeen = {}   -- guid -> time it was last reported
 state.fieldOf = {}    -- guid -> seat whose battlefield it was last reported on
+state.playBy = {}     -- guid -> seat that dropped it on another seat's mat (its caster)
 local PLAY_TO = { playmat = 'battlefield', landZone = 'battlefield', graveyard = 'graveyard', exileZone = 'exile' }
 
 function watchPlay(seat, key, obj)
   if PLAY_TO[key] == nil or obj.type ~= 'Card' then return end
+  if isTableProp(obj) then return end
   local guid = obj.getGUID()
   -- tapping, nudging or lifting a permanent can bounce it out of the zone and
   -- back in; it is still the same permanent, not a new play
@@ -477,11 +547,19 @@ function watchPlay(seat, key, obj)
   end
   local seen = state.playSeen[guid]
   if seen and Time.time - seen < 20 then return end
+  -- who put it there: usually the seat itself, but a player can drop a spell
+  -- aimed at someone onto that player's mat (a Cyclonic Rift on its target)
+  local by = obj.held_by_color
+  if by == nil or by == '' then
+    local h = state.fromHuman[guid]
+    if h and Time.time - h.t < 15 and PLAY_TO[h.key] == nil then by = h.seat end -- left a hand or zone
+  end
+  if by == seat or by == state.seat or not seatData(by or '') then by = nil end
   local origin = from and from.key or 'hand'
   if origin == 'libraryZone' then origin = 'library' elseif origin == 'commandZone' then origin = 'command' elseif origin == 'exileZone' then origin = 'exile' end
   -- wait until nobody holds it and it is at rest, still in the zone
   Wait.condition(function()
-    if obj == nil or obj.isDestroyed() then return end
+    if obj == nil or obj.isDestroyed() or isTableProp(obj) then return end
     local still = false
     for _, z in ipairs(obj.getZones()) do
       local s2, k2 = zoneOwner(z)
@@ -496,17 +574,171 @@ function watchPlay(seat, key, obj)
     local land = false
     local d = seatData(seat)
     if d and d.landZone then
-      for _, o in ipairs(d.landZone.getObjects()) do if o.getGUID() == guid then land = true end end
+      for _, o in ipairs(zoneObjects(d.landZone)) do if o.getGUID() == guid then land = true end end
     end
-    local pl = Player[seat]
-    emit({ ev = 'play', color = seat, player = pl and pl.steam_name or '', guid = guid, from = origin, to = PLAY_TO[key],
-      landRow = land, faceDown = face,
+    local pl = Player[by or seat]
+    if by then state.playBy[guid] = by end
+    emit({ ev = 'play', color = by or seat, onto = by and seat or nil, player = pl and pl.steam_name or '', guid = guid,
+      from = origin, to = PLAY_TO[key], landRow = land, faceDown = face,
       name = face and '(face-down card)' or obj.getName(), desc = face and '' or obj.getDescription(),
       claudeTurn = state.claudeTurn == true })
   end, function()
     return obj == nil or obj.isDestroyed() or (obj.held_by_color == nil and obj.resting)
   end, 30)
 end
+
+---------------------------------------------------------------------------
+-- holding the table for a response (interrupts)
+---------------------------------------------------------------------------
+-- The humans have no stack: a spell is a card that lands on their mat. When
+-- one lands that the AI could counter or copy, nemesis-mcp asks for a hold
+-- the moment the play reaches it (before the model has read it): "Hold on",
+-- and the card lights up. The model answers with a response (release
+-- quiet=true, then its own spell) or a pass (release); if it is slow the hold
+-- runs out by itself, so the table never waits on it for long.
+-- A counter that resolves puts two buttons on the countered card. Only its
+-- owner (or a host) can press them: Countered moves it to their graveyard,
+-- Not countered keeps it (they had an answer of their own). The owner moving
+-- the card to their graveyard by hand counts as Countered too.
+state.hold = nil
+state.countered = {} -- guid -> { owner, name }
+
+-- a card's name for chat: TTS nicknames carry the type line after a newline
+function displayName(nick)
+  return (tostring(nick or ''):match('^[^\n]*') or '')
+end
+
+-- a card the pad reported as another player's play: api() only takes GUIDs
+-- it handed out itself
+local function reportedPlay(guid)
+  if type(guid) ~= 'string' or (state.playSeen[guid] == nil and state.fieldOf[guid] == nil) then
+    error('not a card the pad reported as a play')
+  end
+  local obj = getObjectFromGUID(guid)
+  if obj == nil then error('that card is no longer on the table') end
+  return obj
+end
+
+function ops.hold(req)
+  local seat = requireSeat()
+  local obj = reportedPlay(req.guid)
+  local secs = tonumber(req.secs) or (state.roundWait > 0 and state.roundWait or 20)
+  secs = math.max(5, math.min(secs, 60))
+  local name = tostring(req.name or displayName(obj.getName()))
+  local h = { guid = req.guid, name = name, secs = secs }
+  state.hold = h
+  local col = Color.fromString(seat)
+  broadcastToAll('[' .. NAME .. '] Hold on: ' .. name, col)
+  pcall(function() obj.highlightOn(col, secs) end)
+  Wait.time(function()
+    if state.hold ~= h then return end
+    state.hold = nil
+    printToAll('[' .. NAME .. '] OK, ' .. name .. ' resolves', col)
+    emit({ ev = 'hold', result = 'expired', guid = h.guid, name = name, secs = secs })
+  end, secs)
+  return { held = req.guid, secs = secs }
+end
+
+function ops.release(req)
+  local seat = requireSeat()
+  local h = state.hold
+  state.hold = nil
+  if h == nil then return { released = false } end
+  local obj = getObjectFromGUID(h.guid)
+  if obj then pcall(function() obj.highlightOff() end) end
+  if not req.quiet then
+    local msg = (type(req.text) == 'string' and req.text ~= '') and req.text or ('OK, ' .. h.name .. ' resolves')
+    printToAll('[' .. NAME .. '] ' .. msg, Color.fromString(seat))
+  end
+  return { released = h.guid, name = h.name }
+end
+
+local COUNTER_FNS = { onCounterAccept = true, onCounterRefuse = true }
+
+local function removeCounterButtons(obj)
+  local ok, list = pcall(function() return obj.getButtons() end)
+  if not ok or list == nil then return end
+  -- other scripts (the Encoder) keep their own buttons on cards: remove only
+  -- ours, highest index first so the rest keep their places
+  for i = #list, 1, -1 do
+    if COUNTER_FNS[list[i].click_function] then pcall(function() obj.removeButton(list[i].index) end) end
+  end
+end
+
+-- {guid}: the AI's counter resolved; the owner settles their card
+function ops.countered(req)
+  local seat = requireSeat()
+  local obj = reportedPlay(req.guid)
+  local owner = nil
+  for _, z in ipairs(obj.getZones()) do
+    local s = zoneOwner(z)
+    if s and s ~= seat then owner = s end
+  end
+  -- dropped on someone else's mat: the caster owns the spell, not the mat
+  if owner and state.playBy[req.guid] then owner = state.playBy[req.guid] end
+  if owner == nil then
+    -- picked up again: back in a hand (never named: hands stay hidden), or
+    -- off every zone
+    for _, z in ipairs(obj.getZones()) do
+      if z.type == 'Hand' then return { inHand = true, name = displayName(obj.getName()) } end
+    end
+    error('that card is not in another player\'s zones any more')
+  end
+  local name = displayName(obj.getName())
+  local entry = { owner = owner, name = name }
+  state.countered[req.guid] = entry
+  removeCounterButtons(obj)
+  local face = isFaceDown(obj) and -1 or 1 -- buttons go on the side facing up
+  local function btn(fn, label, z, color)
+    obj.createButton({ click_function = fn, function_owner = self, label = label,
+      position = { 0, 0.3 * face, z }, rotation = { 0, 0, face < 0 and 180 or 0 },
+      width = 1100, height = 260, font_size = 150, scale = { 0.5, 1, 0.5 },
+      color = color, font_color = { 1, 1, 1 }, tooltip = owner .. ' only' })
+  end
+  btn('onCounterAccept', 'Countered', -0.35, { 0.6, 0.15, 0.15 })
+  btn('onCounterRefuse', 'Not countered', 0.35, { 0.25, 0.25, 0.25 })
+  broadcastToAll('[' .. NAME .. '] ' .. name .. ' is countered. ' .. owner .. ': press Countered on it', Color.fromString(seat))
+  -- a counter nobody settles should not leave buttons on the card all game
+  Wait.time(function()
+    if state.countered[req.guid] ~= entry then return end
+    state.countered[req.guid] = nil
+    local o = getObjectFromGUID(req.guid)
+    if o then removeCounterButtons(o) end
+    emit({ ev = 'countered', result = 'unanswered', guid = req.guid, name = name, color = owner })
+  end, 120)
+  return { owner = owner, name = name }
+end
+
+function counterSettled(obj, color, accepted, by)
+  local g = obj.getGUID()
+  local c = state.countered[g]
+  removeCounterButtons(obj)
+  if c == nil then return end
+  state.countered[g] = nil
+  if accepted and by ~= 'hand' then
+    local d = seatData(c.owner)
+    if d and d.graveyard then
+      local p = d.graveyard.getPosition()
+      obj.setPositionSmooth({ p.x, p.y + 2, p.z }, false, true)
+      obj.setRotationSmooth({ 0, d.graveyard.getRotation().y, 0 }, false, true)
+    end
+  end
+  emit({ ev = 'countered', result = accepted and 'accepted' or 'refused', guid = g, name = c.name, color = c.owner, by = color })
+end
+
+local function counterClick(obj, color, accepted)
+  local c = state.countered[obj.getGUID()]
+  if c == nil then removeCounterButtons(obj) return end
+  local p = Player[color]
+  if color ~= c.owner and not (p and (p.host or p.admin)) then
+    broadcastToColor('[Nemesis] Only ' .. c.owner .. ' decides about their ' .. c.name .. '.', color, { 1, 0.7, 0.3 })
+    return
+  end
+  counterSettled(obj, color, accepted, 'button')
+end
+
+function onCounterAccept(obj, color) counterClick(obj, color, true) end
+function onCounterRefuse(obj, color) counterClick(obj, color, false) end
 
 ---------------------------------------------------------------------------
 -- pad UI
@@ -571,13 +803,19 @@ function buildControls()
     end
   end
 
-  -- row 3: optional player pads, how long silence waits, flow fallback
-  local nPads = #playerPads()
-  btn(nPads > 0 and 'Pads: on' or 'Pads: off', 'onTogglePlayerPads', -1.65, 0.35, 780, { 0.25, 0.35, 0.25 },
-    'Optional: a small Yes / No / Respond pad for every seated player. Chat answers work without them.')
-  btn(state.roundWait > 0 and ('Wait ' .. state.roundWait .. 's') or 'Wait: off', 'onRoundWait', 0, 0.35, 780, { 0.3, 0.25, 0.4 },
-    'When ' .. NAME .. ' asks "any responses?", silence for this long counts as no responses. Say "wait" in chat to hold it.')
-  btn('Your turn', 'onYourTurn', 1.65, 0.35, 780, { 0.16, 0.45, 0.7 }, 'Fallback: hand the turn to ' .. NAME .. ' (normally automatic)')
+  -- row 3: decision pads on/off, how long silence waits, flow fallback;
+  -- during a Winston draft, the human on turn takes or passes their pile here
+  local wColor, wPile = winstonHumanTurn()
+  if wColor then
+    btn('Take pile ' .. wPile, 'onWinstonTake', -1.2, 0.35, 1100, { 0.15, 0.5, 0.2 }, wColor .. ': keep the pile in your hand')
+    btn('Pass pile ' .. wPile, 'onWinstonPass', 1.2, 0.35, 1100, { 0.5, 0.3, 0.15 }, wColor .. ': put it back with one more card')
+  else
+    btn(state.decisionPads and 'Big pads: on' or 'Big pads: off', 'onToggleDecisionPads', -1.65, 0.35, 780, { 0.25, 0.35, 0.25 },
+      'Decision pads: for a big decision (a board wipe, a huge threat) a Yes / No / Wait pad with a countdown appears on the mat of each player it is for. Chat answers always work.')
+    btn(state.roundWait > 0 and ('Wait ' .. state.roundWait .. 's') or 'Wait: off', 'onRoundWait', 0, 0.35, 780, { 0.3, 0.25, 0.4 },
+      'When ' .. NAME .. ' asks "any responses?", silence for this long counts as no responses. Say "wait" in chat to hold it.')
+    btn('Your turn', 'onYourTurn', 1.65, 0.35, 780, { 0.16, 0.45, 0.7 }, 'Fallback: hand the turn to ' .. NAME .. ' (normally automatic)')
+  end
 
   -- row 4: answers to pad requests + safety
   btn('Yes', 'onYes', -1.8, 0.9, 700, { 0.15, 0.5, 0.2 }, 'Confirm a request on this pad (seat claim)')
@@ -632,7 +870,7 @@ function ops.configure(req)
     for _, m in ipairs(MODES) do if m.id == state.mode then known = true end end
     if not known then state.mode = req.defaultMode or MODES[1].id; changed = true end
   end
-  if changed then buildControls(); refreshPlayerPads() end
+  if changed then buildControls(); refreshAttackPad() end
   return { name = NAME, mode = state.mode, modes = #MODES, changed = changed }
 end
 
@@ -708,6 +946,54 @@ function cycleSeat(dir, player)
   state.seat = free[idx]
   setStatus(NAME .. ' is ' .. state.seat .. ' (set by ' .. player.steam_name .. ')')
   emit({ ev = 'seat', color = state.seat, by = player.color })
+  -- the pad and the attack pad move once the clicking stops, not under
+  -- the cursor of someone still cycling colours
+  local at = Time.time
+  state.seatPickedAt = at
+  Wait.time(function()
+    if state.seatPickedAt ~= at then return end
+    pcall(placePad); pcall(ensureAttackPad)
+  end, 4)
+end
+
+-- Spots for the pad and the attack pad, from the mat's far edge (towards the
+-- table centre) and its left edge as the player sees it (+right). Chosen at
+-- the (S) table after its 2026-10 update: the old pad spot on the strip
+-- between seats sat on the next seat's life tracker.
+local PAD_SPOT = { fromFar = 1.6, fromLeft = 10.92 }          -- flush with the mat's far edge
+local ATTACK_PAD_SPOT = { fromFar = -0.11, fromLeft = 6.69 }  -- on the divider just past it
+
+function cornerSpot(mat, spot)
+  local sc = mat.getScale()
+  return -(sc.z / 2) + spot.fromFar, sc.x / 2 - spot.fromLeft
+end
+
+-- The pad's own spot at its seat: PAD_SPOT on the mat's far edge, turned to
+-- face across the table; when the table has something there, the old spot
+-- on the strip beside the mat. A locked pad stays put.
+function placePad()
+  if state.seat == nil or self.getLock() then return end
+  local d = seatData(state.seat)
+  if d == nil or d.playmat == nil then return end
+  local mat = d.playmat
+  local sc = mat.getScale()
+  local a, r = cornerSpot(mat, PAD_SPOT)
+  local b, f, rt = self.getBounds().size, mat.getTransformForward(), mat.getTransformRight()
+  local ha = (math.abs(f.x) * b.x + math.abs(f.z) * b.z) / 2
+  local hr = (math.abs(rt.x) * b.x + math.abs(rt.z) * b.z) / 2
+  local okf, blocked = pcall(function()
+    -- the pad itself is furniture: test the spot as if it were not there
+    for _, o in ipairs(matFurniture(mat)) do
+      if not o.pad and not o.mine and math.abs(o.a - a) < o.ha + ha and math.abs(o.r - r) < o.hr + hr then return true end
+    end
+    return false
+  end)
+  if okf and blocked then a, r = -(sc.z / 2) + 3.75, sc.x / 2 + 2.75 end
+  local p = matWorld(mat, a, r)
+  local cur = self.getPosition()
+  if math.abs(cur.x - p.x) < 1 and math.abs(cur.z - p.z) < 1 then return end
+  self.setRotation({ 0, mat.getRotation().y + 180, 0 })
+  self.setPositionSmooth({ p.x, cur.y + 1.5, p.z }, false, true)
 end
 
 function onSeatPrev(_, color) cycleSeat(-1, Player[color]) end
@@ -730,6 +1016,7 @@ function onYes(_, color)
     state.pending = nil
     setStatus(NAME .. ' is ' .. state.seat .. ' (confirmed by ' .. Player[color].steam_name .. ')')
     emit({ ev = 'seat', color = state.seat, by = color })
+    pcall(placePad); pcall(ensureAttackPad)
   end
   button('yes', color)
 end
@@ -748,7 +1035,7 @@ function onStop(_, color)
 end
 
 ---------------------------------------------------------------------------
--- player pads and response rounds
+-- decision pads, the attack pad and response rounds
 ---------------------------------------------------------------------------
 -- A round (ops.ask) collects one answer per asked seat and emits a single
 -- ev=round when it is settled:
@@ -757,13 +1044,13 @@ end
 --              up for the round's wait (timedOut=true)
 --   yesno:     ends 'answered' with every seat's answer ('timeout' with
 --              whatever came in, if the wait runs out)
--- Players answer in chat ("no", "go", "wait", "yes"). Tables that like
--- buttons can deploy optional player pads (Yes / No / Respond); presses come
--- back through playerPress(). Outside a round they are plain button events
--- ('respond' = "Claude, do you want to respond to this?", 'no' = "I pass").
+-- Players answer in chat ("no", "go", "wait", "yes"). A round opened with
+-- pads=true (a heavy decision) also puts a decision pad on each asked
+-- seat's mat; presses come back through decisionPress().
 
 state.roundWait = state.roundWait or 15
 local WAITS = { 10, 15, 20, 30, 45, 0 }
+HINT_TIMES = 3 -- rounds of each kind that explain how to answer
 
 function onRoundWait(_, color)
   local idx = 1
@@ -806,8 +1093,9 @@ function chatAnswer(color, text)
     if hasWord(PASS_WORDS, w) then
       r.pending[color] = nil
       r.answers[color] = 'no'
+      removeDecisionPad(r, color)
       if next(r.pending) == nil then return finishRound('all_no') end
-      refreshPlayerPads()
+      refreshDecisionPads(r)
     end
   else
     if not r.pending[color] then return end
@@ -817,40 +1105,79 @@ function chatAnswer(color, text)
     if a == nil then return end
     r.pending[color] = nil
     r.answers[color] = a
+    removeDecisionPad(r, color)
     if next(r.pending) == nil then return finishRound('answered') end
-    refreshPlayerPads()
+    refreshDecisionPads(r)
   end
 end
 
-PLAYER_PAD_SCRIPT = [==[
-nemesisPlayerPad = true
-SEAT, ADMIN = nil, nil
-NAME = 'Kestrel' -- the admin pad sends the real name with every hint
-local hint, asking = '', false
+-- Decision pads: a big pad that appears on the mat of each player a heavy
+-- decision is for (a board wipe, a huge threat, a question that matters),
+-- with the question, a countdown and Yes / No / Wait. Wait pauses the
+-- countdown for everyone until it is pressed again. A seat's pad goes as
+-- soon as that seat answered, the rest when the round settles. The admin
+-- pad's "Decision pads" toggle turns them off (chat answers always work).
+DECISION_PAD_SCRIPT = [==[
+nemesisDecisionPad = true
+SEAT, ADMIN, ROUND = nil, nil, nil
+local view = { name = 'Kestrel', text = '', kind = 'yesno', left = 0, paused = false, by = '' }
 
 function onLoad(s)
   local ok, d = pcall(function() return JSON.decode(s or '') end)
-  if ok and type(d) == 'table' then SEAT = d.seat; ADMIN = d.admin; NAME = d.name or NAME end
+  if ok and type(d) == 'table' then
+    SEAT, ADMIN, ROUND = d.seat, d.admin, d.round
+    if type(d.view) == 'table' then view = d.view end
+  end
   draw()
 end
 
-function onSave() return JSON.encode({ seat = SEAT, admin = ADMIN, name = NAME }) end
+function onSave() return JSON.encode({ seat = SEAT, admin = ADMIN, round = ROUND, view = view }) end
+
+-- break the question into lines of about n characters
+local function wrap(text, n)
+  local lines, line = {}, ''
+  for word in tostring(text):gmatch('%S+') do
+    if line ~= '' and #line + 1 + #word > n then lines[#lines + 1] = line; line = word
+    else line = (line == '' and word) or (line .. ' ' .. word) end
+  end
+  if line ~= '' then lines[#lines + 1] = line end
+  while #lines > 4 do table.remove(lines) end
+  return table.concat(lines, '\n')
+end
 
 function draw()
   self.clearButtons()
   local s = self.getScale()
   local es = { 1 / s.x, 1 / s.y, 1 / s.z }
-  local function at(x, z) return { x / s.x, 0.12 / s.y, z / s.z } end
+  local function at(x, z) return { x / s.x, 0.6 / s.y, z / s.z } end
+  -- a label is a button of size 0 with no colour set: a transparent
+  -- button colour hid the label text along with it
   local function b(lbl, fn, x, z, w, h, fs, col, fcol, tip)
-    self.createButton({ click_function = fn, function_owner = self, label = lbl, tooltip = tip or '',
-      position = at(x, z), scale = es, width = w, height = h, font_size = fs,
-      color = col or { 0, 0, 0, 0 }, font_color = fcol or { 1, 1, 1 } })
+    local spec = { click_function = fn, function_owner = self, label = lbl, tooltip = tip or '',
+      position = at(x, z), scale = es, width = w, height = h, font_size = fs, font_color = fcol or { 1, 1, 1 } }
+    if col then spec.color = col end
+    self.createButton(spec)
   end
-  b((SEAT or '?') .. ' - answer ' .. NAME, 'noop', 0, -0.42, 0, 0, 75, nil, { 1, 0.85, 0.4 })
-  b('Yes', 'onYes', -1.05, 0.08, 450, 220, 100, { 0.15, 0.5, 0.2 }, nil, 'Yes')
-  b('No', 'onNo', 0, 0.08, 450, 220, 100, { 0.6, 0.15, 0.15 }, nil, 'No / no response / I pass')
-  b('Respond', 'onRespond', 1.05, 0.08, 450, 220, 85, { 0.75, 0.45, 0.1 }, nil, 'Hold on, I have a response (or: ' .. NAME .. ', want to respond?)')
-  if hint ~= '' then b(hint, 'noop', 0, 0.5, 0, 0, 60, nil, asking and { 1, 0.9, 0.5 } or { 0.8, 0.8, 0.8 }) end
+  self.setName(view.name .. ': ' .. tostring(view.text))
+  b(view.title or (view.name .. ' asks ' .. (SEAT or '?')), 'noop', 0, -1.75, 0, 0, 130, nil, { 1, 0.85, 0.4 })
+  b(wrap(view.text, 34), 'noop', 0, -0.75, 0, 0, 150, nil, { 1, 1, 1 })
+  local clock
+  if view.note then clock = view.note
+  elseif view.paused then clock = 'PAUSED' .. (view.by ~= '' and (' by ' .. view.by) or '')
+  elseif (view.left or 0) > 0 then clock = view.left .. ' s'
+  else clock = 'no time limit' end
+  b(clock, 'noop', 0, 0.45, 0, 0, view.note and 110 or 160, nil, view.paused and { 1, 0.75, 0.3 } or { 0.8, 0.8, 0.8 })
+  local yesTip = view.yesTip or (view.kind == 'responses' and 'Yes, I respond: hold on' or 'Yes')
+  local noTip = view.noTip or (view.kind == 'responses' and 'No response: let it resolve' or 'No')
+  -- a choice with no clock (a Winston pile) has two buttons and no Wait
+  local x1, x2 = -2.1, 0
+  if view.noWait then x1, x2 = -1.4, 1.4 end
+  b(view.yesLabel or 'Yes', 'onYes', x1, 1.45, 850, 380, 190, { 0.15, 0.5, 0.2 }, nil, yesTip)
+  b(view.noLabel or 'No', 'onNo', x2, 1.45, 850, 380, 190, { 0.6, 0.15, 0.15 }, nil, noTip)
+  if not view.noWait then
+    b(view.paused and 'Resume' or 'Wait', 'onWait', 2.1, 1.45, 850, 380, 170, { 0.7, 0.5, 0.1 }, nil,
+      view.paused and 'Start the countdown again' or 'Pause the countdown while you think')
+  end
 end
 
 function noop() end
@@ -861,78 +1188,350 @@ local function press(id, color)
     for _, o in ipairs(getAllObjects()) do if o.getVar('nemesisPad') == true then a = o; ADMIN = o.getGUID() end end
   end
   if a == nil then broadcastToColor('The Nemesis pad is not on the table', color, { 1, 0.4, 0.4 }) return end
-  a.call('playerPress', { seat = SEAT, clicker = color, id = id })
+  a.call('decisionPress', { seat = SEAT, clicker = color, id = id, round = ROUND })
 end
 function onYes(_, c) press('yes', c) end
 function onNo(_, c) press('no', c) end
-function onRespond(_, c) press('respond', c) end
+function onWait(_, c) press('wait', c) end
 
-function setHint(p)
-  if p and type(p.name) == 'string' and p.name ~= '' then NAME = p.name end
-  hint = (p and p.text) or ''
-  asking = p and p.ask == true
-  self.setColorTint(asking and { 0.55, 0.35, 0.08 } or { 0.16, 0.16, 0.18 })
+function show(p)
+  if type(p) ~= 'table' then return end
+  for k, v in pairs(p) do view[k] = v end
   draw()
 end
 ]==]
 
-function playerPads()
+-- The attack pad: one button beside the AI's life tracker. A player who
+-- attacks the AI presses it; the tap watch still sees the attackers, and
+-- the attack reaches the AI as "on you" only with the button lit (or when
+-- the AI is the attacker's only opponent). It goes dark at the next turn.
+ATTACK_PAD_SCRIPT = [==[
+nemesisAttackPad = true
+ADMIN, NAME, SEAT = nil, 'Kestrel', nil
+local lit, by = false, ''
+
+function onLoad(s)
+  local ok, d = pcall(function() return JSON.decode(s or '') end)
+  if ok and type(d) == 'table' then ADMIN = d.admin; NAME = d.name or NAME; SEAT = d.seat end
+  draw()
+end
+
+function onSave() return JSON.encode({ admin = ADMIN, name = NAME, seat = SEAT }) end
+
+function draw()
+  self.clearButtons()
+  local s = self.getScale()
+  self.createButton({ click_function = 'onPress', function_owner = self,
+    label = lit and (by .. '\nATTACKS ' .. NAME) or ('Attacking\n' .. NAME .. '?'),
+    tooltip = lit and 'Press again to take it back' or ('Press when you attack ' .. NAME),
+    position = { 0, 0.6 / s.y, 0 }, scale = { 1 / s.x, 1 / s.y, 1 / s.z }, width = 1150, height = 650, font_size = 130,
+    color = lit and { 0.75, 0.12, 0.12 } or { 0.25, 0.1, 0.1 }, font_color = { 1, 1, 1 } })
+end
+
+function onPress(_, color)
+  local a = ADMIN and getObjectFromGUID(ADMIN) or nil
+  if a == nil then
+    for _, o in ipairs(getAllObjects()) do if o.getVar('nemesisPad') == true then a = o; ADMIN = o.getGUID() end end
+  end
+  if a == nil then broadcastToColor('The Nemesis pad is not on the table', color, { 1, 0.4, 0.4 }) return end
+  a.call('attackPress', { clicker = color })
+end
+
+function setLit(p)
+  lit = p and p.lit == true
+  by = (p and p.by) or ''
+  if p and type(p.name) == 'string' and p.name ~= '' then NAME = p.name end
+  self.setColorTint(lit and { 0.55, 0.08, 0.08 } or { 0.16, 0.16, 0.18 })
+  draw()
+end
+]==]
+
+local function objectsWith(var)
   local out = {}
   for _, o in ipairs(getAllObjects()) do
-    if o.getVar('nemesisPlayerPad') == true then out[#out + 1] = o end
+    local ok, v = pcall(function() return o.getVar(var) end)
+    if ok and v == true then out[#out + 1] = o end
   end
   return out
 end
 
--- player pad spot: text facing the player (same yaw as the mat)
-local function playerPadSpot(c)
+function decisionPads() return objectsWith('nemesisDecisionPad') end
+
+-- the middle of a seat's mat, turned to face its player
+local function decisionPadSpot(c)
   local d = seatData(c)
   if d == nil or d.playmat == nil then return nil end
-  local mat = d.playmat
-  local sc = mat.getScale()
-  -- just past the far edge of the mat, on the player's left (the mat's +right axis)
-  local p = matWorld(mat, -(sc.z / 2 + 1.0), sc.x / 2 - 2.5)
-  return { x = p.x, y = 1.2, z = p.z }, mat.getRotation().y
+  local p = d.playmat.getPosition()
+  return { x = p.x, y = p.y + 1.2, z = p.z }, d.playmat.getRotation().y
 end
 
-function deployPlayerPads()
-  local made = {}
-  local have = {}
-  for _, o in ipairs(playerPads()) do have[o.getVar('SEAT') or ''] = true end
-  for _, c in ipairs(seatedHumans()) do
-    if not have[c] then
-      local pos, yaw = playerPadSpot(c)
-      if pos then
-        spawnObjectData({ data = {
-          Name = 'BlockSquare', Nickname = 'Nemesis player pad (' .. c .. ')', Locked = true,
-          Transform = { posX = pos.x, posY = pos.y, posZ = pos.z, rotX = 0, rotY = yaw, rotZ = 0, scaleX = 3.4, scaleY = 0.15, scaleZ = 1.4 },
-          ColorDiffuse = { r = 0.16, g = 0.16, b = 0.18 },
-          LuaScript = PLAYER_PAD_SCRIPT,
-          LuaScriptState = JSON.encode({ seat = c, admin = self.getGUID() }),
-        } })
-        made[#made + 1] = c
-      end
-    end
+local function roundClock(r)
+  local by = {}
+  for c in pairs(r.paused or {}) do by[#by + 1] = c end
+  table.sort(by)
+  return { left = r.wait > 0 and math.max(0, math.ceil(r.left or 0)) or 0, paused = #by > 0, by = table.concat(by, ', ') }
+end
+
+-- one decision pad on a seat's mat; round is the round id, or 'winston'
+-- for a Winston pile. Returns its guid.
+function spawnDecisionPad(c, round, view)
+  local pos, yaw = decisionPadSpot(c)
+  if pos == nil then return nil end
+  local o = spawnObjectData({ data = {
+    Name = 'BlockSquare', Nickname = 'Nemesis decision (' .. c .. ')', Locked = true,
+    Transform = { posX = pos.x, posY = pos.y, posZ = pos.z, rotX = 0, rotY = yaw, rotZ = 0, scaleX = 7, scaleY = 0.2, scaleZ = 4.6 },
+    ColorDiffuse = { r = 0.1, g = 0.1, b = 0.13 },
+    LuaScript = DECISION_PAD_SCRIPT,
+    LuaScriptState = JSON.encode({ seat = c, admin = self.getGUID(), round = round, view = view }),
+  }, callback_function = function(o) o.setLock(true) end })
+  return o and o.getGUID() or nil
+end
+
+function spawnDecisionPads(r)
+  r.pads = {}
+  for _, c in ipairs(r.asked) do
+    local clock = roundClock(r)
+    r.pads[c] = spawnDecisionPad(c, r.id, { name = NAME, text = r.text, kind = r.kind, left = clock.left, paused = false, by = '' })
   end
-  return made
 end
 
-function removePlayerPads()
+-- Winston: the human looking at a pile gets Take / Pass on a pad too
+function showWinstonPad(color, pile, n, last)
+  removeWinstonPad()
+  local dr = state.draft
+  if dr == nil or not state.decisionPads then return end
+  dr.pad = spawnDecisionPad(color, 'winston', { name = NAME, title = 'Winston draft: your pick, ' .. color,
+    text = 'Pile ' .. pile .. ' (' .. n .. ' card' .. (n == 1 and '' or 's') .. ') is in your hand. Take it, or pass it back with one more card?',
+    note = last and 'Passing pile 3 takes the top card of the stack' or ('Passing shows you pile ' .. (pile + 1)),
+    kind = 'yesno', left = 0, paused = false, by = '', noWait = true, yesLabel = 'Take', noLabel = 'Pass',
+    yesTip = 'Keep this pile', noTip = 'Put it back with one more card' })
+end
+
+function removeWinstonPad()
+  local dr = state.draft
+  local g = dr and dr.pad
+  if g == nil then return end
+  dr.pad = nil
+  local o = getObjectFromGUID(g)
+  if o then pcall(function() destroyObject(o) end) end
+end
+
+function removeDecisionPad(r, c)
+  local g = r and r.pads and r.pads[c]
+  if g == nil then return end
+  r.pads[c] = nil
+  local o = getObjectFromGUID(g)
+  if o then pcall(function() destroyObject(o) end) end
+end
+
+-- every decision pad on the table (a reload loses the round they belonged to)
+function removeDecisionPads()
   local n = 0
-  for _, o in ipairs(playerPads()) do destroyObject(o); n = n + 1 end
+  for _, o in ipairs(decisionPads()) do pcall(function() destroyObject(o) end); n = n + 1 end
   return n
 end
 
-function onTogglePlayerPads(_, color)
-  if #playerPads() > 0 then
-    local n = removePlayerPads()
-    Wait.frames(function() setStatus('Removed ' .. n .. ' player pads') end, 2)
-  else
-    local made = deployPlayerPads()
-    Wait.frames(function()
-      setStatus(#made > 0 and ('Player pads for ' .. table.concat(made, ', ')) or 'No seated players to give a pad')
-    end, 10)
+function refreshDecisionPads(r)
+  if r == nil or r.pads == nil then return end
+  local clock = roundClock(r)
+  for c, g in pairs(r.pads) do
+    local o = getObjectFromGUID(g)
+    if o then pcall(function() o.call('show', clock) end) end
   end
+end
+
+state.decisionPads = state.decisionPads ~= false
+
+function onToggleDecisionPads(_, color)
+  state.decisionPads = not state.decisionPads
+  if not state.decisionPads then removeDecisionPads() end
+  setStatus(state.decisionPads and 'Decision pads on: big decisions get a pad on your mat' or 'Decision pads off: answer in chat')
+end
+
+-- a press on a decision pad (called by its script)
+function decisionPress(p)
+  if type(p) ~= 'table' or p.seat == nil then return end
+  if p.round == 'winston' then
+    local pl = Player[p.clicker]
+    if p.clicker ~= p.seat and not (pl and (pl.host or pl.admin)) then
+      broadcastToColor('[Nemesis] This pick is ' .. p.seat .. "'s.", p.clicker, { 1, 0.7, 0.3 })
+      return
+    end
+    if p.id == 'yes' or p.id == 'no' then winstonChoice(p.seat, p.id == 'yes') end
+    return
+  end
+  local r = state.round
+  local seat, id = p.seat, p.id
+  if r == nil or r.id ~= p.round then
+    -- a pad left over from a settled round
+    for _, o in ipairs(decisionPads()) do
+      if o.getVar('ROUND') == p.round then pcall(function() destroyObject(o) end) end
+    end
+    return
+  end
+  local pl = Player[p.clicker]
+  if p.clicker ~= seat and not (pl and (pl.host or pl.admin)) then
+    broadcastToColor('[Nemesis] This decision is ' .. seat .. "'s.", p.clicker, { 1, 0.7, 0.3 })
+    return
+  end
+  emit({ ev = 'button', id = id, color = seat, clicker = p.clicker, name = Player[seat] and Player[seat].steam_name or '', pad = 'decision' })
+  if id == 'wait' then
+    r.paused = r.paused or {}
+    local paused = not r.paused[seat]
+    r.paused[seat] = paused or nil
+    emit({ ev = 'round_pause', id = r.id, color = seat, paused = paused, left = roundClock(r).left, anyPaused = next(r.paused) ~= nil })
+    refreshDecisionPads(r)
+    return
+  end
+  if not r.pending[seat] then return end
+  r.pending[seat] = nil
+  if r.paused then r.paused[seat] = nil end
+  if r.kind == 'responses' then
+    r.answers[seat] = id == 'yes' and 'respond' or 'no'
+    removeDecisionPad(r, seat)
+    if id == 'yes' then return finishRound('respond', seat) end
+    if next(r.pending) == nil then return finishRound('all_no') end
+  else
+    r.answers[seat] = id
+    removeDecisionPad(r, seat)
+    if next(r.pending) == nil then return finishRound('answered') end
+  end
+  refreshDecisionPads(r)
+end
+
+-- the round's countdown: one tick a second, frozen while anyone pressed Wait
+function startRoundClock(r)
+  if r.wait <= 0 then return end
+  r.left = r.wait
+  local timer
+  timer = Wait.time(function()
+    if state.round ~= r or stale() then Wait.stop(timer) return end
+    if r.paused and next(r.paused) ~= nil then return end
+    r.left = r.left - 1
+    if r.left <= 0 then
+      Wait.stop(timer)
+      finishRound(r.kind == 'responses' and 'all_no' or 'timeout', nil, true)
+      return
+    end
+    refreshDecisionPads(r)
+  end, 1, -1)
+end
+
+-- the attack pad ------------------------------------------------------------
+
+function attackPads() return objectsWith('nemesisAttackPad') end
+
+-- beside the AI's life tracker, towards the table's middle; without a
+-- tracker, off the far left corner of its mat
+local function attackPadSpot()
+  local d = state.seat and seatData(state.seat)
+  if d == nil or d.playmat == nil then return nil end
+  local yaw = d.playmat.getRotation().y
+  local ca, cr = cornerSpot(d.playmat, ATTACK_PAD_SPOT)
+  if not blockedByFurniture(d.playmat, ca, cr, 0.75 + 0.15, 1.3 + 0.15, true) then
+    local w = matWorld(d.playmat, ca, cr)
+    return { x = w.x, y = 1.2, z = w.z }, yaw
+  end
+  local tr = d.lifeTracker
+  if tr then
+    local p = tr.getPosition()
+    local mat = d.playmat
+    local b = tr.getBounds().size
+    local off = math.max(b.x, b.z) / 2 + 1.6
+    -- towards the middle first (the old spot), then beside the tracker, then
+    -- behind it; the (S) table's commander damage tiles now sit in front
+    local ta, trr = matLocal(mat, p)
+    local tries = { { -off, 0 }, { 0, off + 0.6 }, { 0, -(off + 0.6) }, { off, 0 }, { -(off + 1.6), 0 } }
+    for _, t in ipairs(tries) do
+      local a, r = ta + t[1], trr + t[2]
+      if not blockedByFurniture(mat, a, r, 0.75 + 0.15, 1.3 + 0.15, true) then
+        local w = matWorld(mat, a, r)
+        return { x = w.x, y = p.y + 0.5, z = w.z }, yaw
+      end
+    end
+    local w = matWorld(mat, ta - off, trr)
+    return { x = w.x, y = p.y + 0.5, z = w.z }, yaw
+  end
+  local sc = d.playmat.getScale()
+  local p = matWorld(d.playmat, -(sc.z / 2 + 1.5), -(sc.x / 2 - 1.5))
+  return { x = p.x, y = 1.2, z = p.z }, yaw
+end
+
+-- one attack pad, for the AI's current seat; a pad a player moved stays put
+function ensureAttackPad()
+  if state.seat == nil then return end
+  for _, o in ipairs(attackPads()) do
+    if o.getVar('SEAT') == state.seat then
+      if not o.getLock() then o.setLock(true) end
+      -- a pad covering the table's own tiles (an older pad's spot) moves
+      local sd = seatData(state.seat)
+      local mat = sd and sd.playmat
+      local a, r = 0, 0
+      if mat then a, r = matLocal(mat, o.getPosition()) end
+      if mat and blockedByFurniture(mat, a, r, 0.75, 1.3, true) then
+        local pos = attackPadSpot()
+        if pos then o.setPosition(pos) end
+      end
+      return
+    end
+    pcall(function() destroyObject(o) end) -- left from an earlier seat
+  end
+  local pos, yaw = attackPadSpot()
+  if pos == nil then return end
+  spawnObjectData({ data = {
+    Name = 'BlockSquare', Nickname = 'Nemesis attack pad', Locked = true,
+    Transform = { posX = pos.x, posY = pos.y, posZ = pos.z, rotX = 0, rotY = yaw + 180, rotZ = 0, scaleX = 2.6, scaleY = 0.2, scaleZ = 1.5 },
+    ColorDiffuse = { r = 0.16, g = 0.16, b = 0.18 },
+    LuaScript = ATTACK_PAD_SCRIPT,
+    LuaScriptState = JSON.encode({ admin = self.getGUID(), name = NAME, seat = state.seat }),
+  }, callback_function = function(o) o.setLock(true) end })
+end
+
+function refreshAttackPad()
+  local call = state.attackCall
+  for _, o in ipairs(attackPads()) do
+    pcall(function() o.call('setLit', { lit = call ~= nil, by = call and call.color or '', name = NAME }) end)
+  end
+end
+
+-- the turn moved on: the button goes dark
+function clearAttackCall()
+  state.lastAttack = nil
+  if state.attackCall == nil then return end
+  state.attackCall = nil
+  refreshAttackPad()
+end
+
+-- a press on the attack pad (called by its script)
+function attackPress(p)
+  local c = type(p) == 'table' and p.clicker or nil
+  if c == nil or c == state.seat then return end
+  if state.attackCall then
+    local was = state.attackCall
+    clearAttackCall()
+    emit({ ev = 'attack', color = was.color, by = c, takenBack = true })
+    return
+  end
+  local turn = Turns.turn_color
+  local attacker = (turn ~= nil and turn ~= '' and turn ~= state.seat and not state.claudeTurn) and turn or c
+  local call = { color = attacker, by = c, t = Time.time }
+  state.attackCall = call
+  refreshAttackPad()
+  local pl = Player[attacker]
+  -- creatures that tapped before the press were at the AI after all
+  local last = state.lastAttack
+  if last and last.seat == attacker and Time.time - last.t < 90 then
+    state.lastAttack = nil
+    call.reported = true
+    emit({ ev = 'attack', color = attacker, player = pl and pl.steam_name or '', cards = last.cards, onMe = true, late = true })
+    return
+  end
+  -- attackers with vigilance never tap: say so if no taps follow
+  Wait.time(function()
+    if state.attackCall ~= call or call.reported or state.taps[attacker] then return end
+    call.reported = true
+    emit({ ev = 'attack', color = attacker, player = pl and pl.steam_name or '', cards = '[]', onMe = true, noTaps = true })
+  end, 6)
 end
 
 local function roundView(r)
@@ -940,21 +1539,6 @@ local function roundView(r)
   local waiting = {}
   for _, c in ipairs(r.asked) do if r.pending[c] then waiting[#waiting + 1] = c end end
   return { id = r.id, kind = r.kind, text = r.text, asked = r.asked, waitingOn = waiting, answers = r.answers }
-end
-
-function refreshPlayerPads()
-  local r = state.round
-  for _, o in ipairs(playerPads()) do
-    local seat = o.getVar('SEAT')
-    local hint, ask = '', false
-    if r and r.pending[seat] then
-      ask = true
-      hint = NAME .. ': ' .. r.text:sub(1, 60) .. (r.kind == 'responses' and '  (No = pass)' or '')
-    elseif r and r.answers[seat] then
-      hint = 'You answered ' .. r.answers[seat] .. ', waiting on the others'
-    end
-    pcall(function() o.call('setHint', { text = hint, ask = ask, name = NAME }) end)
-  end
 end
 
 function finishRound(result, by, timedOut, card)
@@ -972,27 +1556,11 @@ function finishRound(result, by, timedOut, card)
   elseif result == 'respond' then
     broadcastToAll('[Nemesis] ' .. tostring(by) .. ' has a response - hold on', { 1, 0.7, 0.3 })
   elseif result == 'all_no' then
-    printToAll(timedOut and ('[Nemesis] No responses (' .. r.wait .. ' s)') or '[Nemesis] No responses', { 0.7, 0.7, 0.7 })
+    printToAll('[Nemesis] No responses', { 0.7, 0.7, 0.7 })
   elseif result == 'timeout' then
-    printToAll('[Nemesis] Out of time; answers so far: ' .. (#parts > 0 and table.concat(parts, ', ') or 'none'), { 0.7, 0.7, 0.7 })
+    printToAll('[Nemesis] Out of time: ' .. (#parts > 0 and table.concat(parts, ', ') or 'no answers'), { 0.7, 0.7, 0.7 })
   end
-  refreshPlayerPads()
-end
-
--- a press on a player pad (called by the player pad's script)
-function playerPress(p)
-  if type(p) ~= 'table' or p.seat == nil then return end
-  local seat, id = p.seat, p.id
-  local pl = Player[seat]
-  emit({ ev = 'button', id = id, color = seat, clicker = p.clicker, name = pl and pl.steam_name or '', pad = 'player' })
-  local r = state.round
-  if r and r.pending[seat] then
-    r.pending[seat] = nil
-    r.answers[seat] = id
-    if r.kind == 'responses' and id == 'respond' then return finishRound('respond', seat) end
-    if next(r.pending) == nil then return finishRound(r.kind == 'responses' and 'all_no' or 'answered') end
-    refreshPlayerPads()
-  end
+  for c in pairs(r.pads or {}) do removeDecisionPad(r, c) end
 end
 
 ---------------------------------------------------------------------------
@@ -1034,8 +1602,19 @@ end
 
 
 -- seat colours the table knows, in TTS turn order
+-- Global.getTable copies the whole seat table across scripts; every op,
+-- every zone event and the 1.5 s tap poll read it, so keep a copy for a
+-- second (the table's layout does not change mid-game).
+local dataCache = { t = -10, d = nil }
+function globalData()
+  if Time.time - dataCache.t > 1 or dataCache.d == nil then
+    dataCache = { t = Time.time, d = Global.getTable('data') }
+  end
+  return dataCache.d
+end
+
 function refreshColors()
-  local d = Global.getTable('data')
+  local d = globalData()
   if d == nil then return end
   local out = {}
   for _, c in ipairs(CANON) do if d[c] ~= nil then out[#out + 1] = c end end
@@ -1055,6 +1634,54 @@ end
 function matWorld(mat, along, right, y)
   local p, f, r = mat.getPosition(), mat.getTransformForward(), mat.getTransformRight()
   return { x = p.x + f.x * along + r.x * right, y = y or p.y, z = p.z + f.z * along + r.z * right }
+end
+
+-- Locked table furniture on and around a mat (counters, trackers, helper
+-- tiles) as mat-local boxes { a, r, ha, hr, mine }, so cards and our pads are
+-- not put on top of them. The (S) table's 2026-10 update put mana and energy
+-- counters inside the land box and commander damage tiles where the front
+-- creature row starts; pieces() skips locked objects, so slots landed on
+-- them. Cards and piles are left to pieces(); scripting zones, the Highlight
+-- Mat, mat-sized objects and anything parked under the table are skipped.
+-- The pad counts although it is unlocked; attack pads are marked mine.
+local furnitureCache = {}
+function matFurniture(mat)
+  local key = mat.getGUID()
+  local c = furnitureCache[key]
+  if c and Time.time - c.t < 5 then return c.list end
+  local f, r, s = mat.getTransformForward(), mat.getTransformRight(), mat.getScale()
+  local list = {}
+  for _, o in ipairs(getAllObjects()) do
+    local t = o.type
+    local okv, v = pcall(function() return o.getVar('nemesisAttackPad') end)
+    local mine = okv and v == true
+    if (mine or o == self or o.getLock()) and o ~= mat and t ~= 'Card' and t ~= 'Deck' and t ~= 'Scripting'
+        and o.getName() ~= 'Highlight Mat' then
+      local okb, b = pcall(function() return o.getBounds() end)
+      if okb and b and b.center and b.size and b.center.y > 0.5 then
+        local a, rr = matLocal(mat, b.center)
+        local ha = (math.abs(f.x) * b.size.x + math.abs(f.z) * b.size.z) / 2
+        local hr = (math.abs(r.x) * b.size.x + math.abs(r.z) * b.size.z) / 2
+        if ha < s.z / 3 and hr < s.x / 3
+            and math.abs(a) - ha < s.z / 2 + 4 and math.abs(rr) - hr < s.x / 2 + 6 then
+          list[#list + 1] = { a = a, r = rr, ha = ha, hr = hr, mine = mine, pad = o == self }
+        end
+      end
+    end
+  end
+  furnitureCache[key] = { t = Time.time, list = list }
+  return list
+end
+
+-- true when a box at mat-local (a, r) with half sizes (ha, hr) overlaps
+-- furniture; skipMine leaves out the pad and the attack pad
+function blockedByFurniture(mat, a, r, ha, hr, skipMine)
+  for _, o in ipairs(matFurniture(mat)) do
+    if not (skipMine and o.mine) and math.abs(o.a - a) < o.ha + ha and math.abs(o.r - r) < o.hr + hr then
+      return true
+    end
+  end
+  return false
 end
 
 -- the seat's side panel (life tracker, command mats) in mat-local terms
@@ -1161,7 +1788,7 @@ function adaptSeat(color, d)
 end
 
 function seatData(color)
-  local all = Global.getTable('data')
+  local all = globalData()
   if all == nil then return nil end
   local d = all[color]
   if d == nil or d.playmat == nil then return d end
@@ -1230,10 +1857,25 @@ local function posOf(obj)
 end
 
 -- objects in a zone that are game pieces (skip the mat, zones, the pad...)
+-- A zone with tags lists only objects carrying a matching tag; the table's
+-- 2026-10-28 update tagged its zones and libraries read empty. Ask for
+-- everything in the zone (ignore_tags) and fall back for plain objects.
+-- ignore_tags also returns GUID-less scenery (the table itself): skip it.
+function zoneObjects(z)
+  local ok, objs = pcall(function() return z.getObjects(true) end)
+  if not ok or type(objs) ~= 'table' then objs = z.getObjects() end
+  local out = {}
+  for _, o in ipairs(objs) do
+    local okg, g = pcall(function() return o.getGUID() end)
+    if okg and g ~= nil and g ~= '' then out[#out + 1] = o end
+  end
+  return out
+end
+
 local function pieces(zone)
   local out = {}
   if zone == nil then return out end
-  for _, o in ipairs(zone.getObjects()) do
+  for _, o in ipairs(zoneObjects(zone)) do
     local t = o.type
     if t == 'Card' or t == 'Deck' or t == 'Tile' or t == 'Generic' or t == 'Figurine' or t == 'Chip' or t == 'Block' or t == 'Dice' then
       if o.getName() ~= 'Highlight Mat' and o.getGUID() ~= self.getGUID() and not o.getLock() then
@@ -1380,7 +2022,7 @@ local function battlefield(d, mine)
   local out = {}
   local landGuids = {}
   if d.landZone then
-    for _, o in ipairs(d.landZone.getObjects()) do landGuids[o.getGUID()] = true end
+    for _, o in ipairs(zoneObjects(d.landZone)) do landGuids[o.getGUID()] = true end
   end
   local cardsByGuid = {}
   local loose = {}
@@ -1389,7 +2031,8 @@ local function battlefield(d, mine)
     if landGuids[e.guid] then e.row = 'land' end
     if o.type == 'Card' then
       e.faceDown = isFaceDown(o)
-      if e.faceDown and not mine then
+      -- during a draft your own face-down cards are unopened packs too
+      if e.faceDown and (not mine or state.draft) then
         e.nick = '(face-down card)'
       else
         e.nick = o.getName()
@@ -1420,6 +2063,85 @@ local function battlefield(d, mine)
   return out
 end
 
+-- Where things are around the AI's seat, in mat terms (along = the mat's
+-- forward axis, right = its right axis, from the mat's centre): every
+-- non-card object within reach, the pads, and the draft spots. For fitting
+-- the pad to a new table layout; it reads positions and public text only.
+function ops.layout(req)
+  local seat = state.seat -- works while STOP is on, like snapshot
+  if seat == nil then error(NAME .. ' has no seat yet') end
+  local d = seatData(seat)
+  if d == nil or d.playmat == nil then error('no mat for ' .. seat) end
+  local mat = d.playmat
+  local function at(p)
+    local a, r = matLocal(mat, p)
+    return { along = round(a), right = round(r), y = round(p.y) }
+  end
+  local out = { seat = seat, mat = { pos = at(mat.getPosition()), yaw = round(mat.getRotation().y),
+    scale = { x = round(mat.getScale().x), z = round(mat.getScale().z) } }, objects = {}, cards = {} }
+  local reach = tonumber(req.reach) or 26
+  for _, o in ipairs(getAllObjects()) do
+    local p = o.getPosition()
+    local a, r = matLocal(mat, p)
+    if math.abs(a) <= reach and math.abs(r) <= reach then
+      local e = at(p)
+      e.guid, e.type, e.name = o.getGUID(), o.type, (o.getName():match('^[^\n]*') or '')
+      if o.type == 'Card' or o.type == 'Deck' then
+        e.n = o.type == 'Deck' and o.getQuantity() or 1
+        if isTableProp(o) then e.tableProp = true end -- e.g. Lotus Helper's fetch previews
+        out.cards[#out.cards + 1] = e
+      else
+        e.desc = o.getDescription():sub(1, 60)
+        e.locked = o.getLock()
+        e.yaw = round(o.getRotation().y)
+        local sc = o.getScale()
+        e.scale = { x = round(sc.x), z = round(sc.z) }
+        if o.type == 'Scripting' then
+          e.scale.y = round(sc.y)
+          local okt, tags = pcall(function() return o.getTags() end)
+          if okt and type(tags) == 'table' and #tags > 0 then e.tags = table.concat(tags, ',') end
+        end
+        local ok, src = pcall(function() return o.getLuaScript() end)
+        if ok and src and src ~= '' then
+          local fns = {}
+          for fn in src:gmatch('function%s+([%w_]+)%s*%(') do
+            if #fns < 25 then fns[#fns + 1] = fn end
+          end
+          e.script = table.concat(fns, ',')
+        end
+        local okb, btns = pcall(function() return o.getButtons() end)
+        if okb and btns and #btns > 0 then
+          local labels = {}
+          for i, b in ipairs(btns) do if i <= 6 then labels[#labels + 1] = tostring(b.label):sub(1, 20) end end
+          e.buttons = table.concat(labels, '|')
+        end
+        if o == self then e.thisPad = true end
+        out.objects[#out.objects + 1] = e
+      end
+    end
+  end
+  if d.lifeTracker then out.lifeTracker = at(d.lifeTracker.getPosition()) end
+  out.slots = slotReport(d)
+  local ap = attackPadSpot()
+  if ap then out.attackPadSpot = at(ap) end
+  -- which object the table links for each zone, and what it holds with and
+  -- without tag filtering
+  out.zones = {}
+  for _, k in ipairs({ 'libraryZone', 'graveyard', 'exileZone', 'commandZone', 'landZone' }) do
+    local z = d[k]
+    if z ~= nil then
+      local okp, plain = pcall(function() return #z.getObjects() end)
+      out.zones[k] = { guid = z.getGUID(), plain = okp and plain or -1, all = #zoneObjects(z) }
+    end
+  end
+  local dr = state.draft
+  if dr and dr.format == 'winston' and #dr.seats == 2 then
+    local s = winstonSpotsFor(dr.seats[1], dr.seats[2])
+    out.winston = { stack = at(s.stack), piles = { at(s.piles[1]), at(s.piles[2]), at(s.piles[3]) } }
+  end
+  return out
+end
+
 function ops.ping(req)
   return { ok = true, version = NEMESIS_VERSION, seat = state.seat, stopped = state.stopped }
 end
@@ -1441,7 +2163,7 @@ function seatCounters(color, d)
     if not o.isDestroyed() then
       -- nearest mat wins: compare against every seat's mat
       local p, best, bestD = o.getPosition(), nil, nil
-      local all = Global.getTable('data') or {}
+      local all = globalData() or {}
       for c, sd in pairs(all) do
         if type(sd) == 'table' and sd.playmat then
           local mp = sd.playmat.getPosition()
@@ -1511,7 +2233,7 @@ function ops.snapshot(req)
     seats = seats, turns = turns,
     pad = { seat = state.seat, stopped = state.stopped, pending = state.pending, version = NEMESIS_VERSION,
       mode = state.mode, modeName = modeInfo(state.mode).name, newPlayers = newPlayerList(),
-      round = roundView(state.round), playerPads = #playerPads(), roundWait = state.roundWait },
+      round = roundView(state.round), decisionPads = state.decisionPads, roundWait = state.roundWait },
   }
 end
 
@@ -1561,9 +2283,10 @@ function ops.say(req)
   return { said = text }
 end
 
--- Ask the table something and collect one answer per seat on the player
--- pads (see playerPress). kind = 'responses' ("any responses?") or 'yesno'.
--- seats defaults to every seated human. A new ask replaces an open one.
+-- Ask the table something and collect one answer per seat, from chat or,
+-- with pads=true (a heavy decision), from a decision pad on each asked
+-- seat's mat. kind = 'responses' ("any responses?") or 'yesno'. seats
+-- defaults to every seated human. A new ask replaces an open one.
 function ops.ask(req)
   local seat = requireSeat()
   local kind = req.kind == 'yesno' and 'yesno' or 'responses'
@@ -1571,43 +2294,45 @@ function ops.ask(req)
   if type(req.seats) == 'table' and #req.seats > 0 then
     for _, c in ipairs(req.seats) do if c ~= seat then seats[#seats + 1] = c end end
   else
-    seats = seatedHumans()
+    for _, c in ipairs(seatedHumans()) do if not seatSkipped(c) then seats[#seats + 1] = c end end
   end
   if #seats == 0 then error('nobody to ask') end
   local text = tostring(req.text or '')
   if text == '' then text = kind == 'responses' and 'Any responses?' or 'Yes or no?' end
   state.roundSeq = (state.roundSeq or 0) + 1
+  local pads = req.pads == true and state.decisionPads
   local wait = tonumber(req.wait)
   if wait == nil or wait < 0 then
     wait = state.roundWait
-    -- a yes/no question deserves longer than "any responses?"
-    if kind == 'yesno' and wait > 0 then wait = math.max(wait * 2, 30) end
+    -- a yes/no question or a heavy decision deserves longer than "any responses?"
+    if (kind == 'yesno' or pads) and wait > 0 then wait = math.max(wait * 2, 30) end
   end
   local r = { id = state.roundSeq, kind = kind, text = text, asked = seats, pending = {}, answers = {}, wait = wait, quiet = req.quiet == true }
   for _, c in ipairs(seats) do r.pending[c] = true end
-  local replaced = state.round and state.round.id or nil
+  local old = state.round
+  local replaced = old and old.id or nil
+  if old then for c in pairs(old.pads or {}) do removeDecisionPad(old, c) end end
   state.round = r
-  local how
-  if kind == 'responses' then
-    how = '  [say "no" to pass, "wait" to respond' .. (wait > 0 and ('; ' .. wait .. ' s]') or ']')
-  else
-    how = '  [answer yes or no in chat]'
+  -- TTS keeps no chat history, so every line counts: the how-to goes out
+  -- with the first few rounds of each kind, after that only the seconds
+  local secs = wait > 0 and (' (' .. wait .. ' s)') or ''
+  local key = (pads and 'pads') or (r.quiet and 'quiet') or kind
+  state.hints = state.hints or {}
+  state.hints[key] = (state.hints[key] or 0) + 1
+  local how = secs
+  if state.hints[key] <= HINT_TIMES then
+    if pads then how = '  [answer on the pad on your mat, or in chat' .. (wait > 0 and ('; ' .. wait .. ' s, Wait pauses]') or ']')
+    elseif r.quiet then how = '  [drop a response on my mat or say "wait"' .. (wait > 0 and ('; ' .. wait .. ' s]') or ']')
+    elseif kind == 'responses' then how = '  [say "no" to pass, "wait" to respond' .. (wait > 0 and ('; ' .. wait .. ' s]') or ']')
+    else how = '  [answer yes or no in chat]' end
   end
-  if r.quiet then
-    -- a spell going on the stack: no question, just the window
-    printToAll('[' .. NAME .. '] ' .. text .. '  [drop a response on my mat or say "wait"' .. (wait > 0 and ('; ' .. wait .. ' s]') or ']'),
-      Color.fromString(seat))
-  else
-    broadcastToAll('[' .. NAME .. '] ' .. text .. how, Color.fromString(seat))
-  end
-  refreshPlayerPads()
-  if wait > 0 then
-    Wait.time(function()
-      if state.round ~= r then return end
-      finishRound(r.kind == 'responses' and 'all_no' or 'timeout', nil, true)
-    end, wait)
-  end
-  return { round = r.id, kind = kind, asked = seats, playerPads = #playerPads(), replaced = replaced, wait = wait }
+  local line = '[' .. NAME .. '] ' .. text .. how
+  -- a spell going on the stack is no question, just a quiet window (loud for
+  -- a response to someone else's spell, so they stop and look)
+  if r.quiet and not req.loud and not pads then printToAll(line, Color.fromString(seat)) else broadcastToAll(line, Color.fromString(seat)) end
+  if pads then spawnDecisionPads(r) end
+  startRoundClock(r)
+  return { round = r.id, kind = kind, asked = seats, pads = pads == true, replaced = replaced, wait = wait }
 end
 
 function ops.cancel_round(req)
@@ -1615,15 +2340,8 @@ function ops.cancel_round(req)
   local r = state.round
   if r == nil then return { cancelled = false } end
   state.round = nil
-  refreshPlayerPads()
+  for c in pairs(r.pads or {}) do removeDecisionPad(r, c) end
   return { cancelled = true, id = r.id, answers = r.answers }
-end
-
--- Claude can deploy or remove the player pads too (setup help)
-function ops.player_pads(req)
-  requireSeat()
-  if req.remove then return { removed = removePlayerPads() } end
-  return { deployed = deployPlayerPads() }
 end
 
 ---------------------------------------------------------------------------
@@ -1639,6 +2357,29 @@ local function myData()
   local d = seatData(seat)
   if d == nil then error('table has no data for ' .. seat) end
   return seat, d
+end
+
+-- What nemesis-mcp needs for a response window, in one light call: my own
+-- battlefield cards without on-card state (no Encoder calls, no other seats)
+-- and my hand. Works while STOP is on, like snapshot.
+function ops.window(req)
+  local seat = state.seat
+  if seat == nil then error('no seat') end
+  local d = seatData(seat)
+  if d == nil or d.playmat == nil then error('table has no data for ' .. seat) end
+  local lands = {}
+  if d.landZone then
+    for _, o in ipairs(zoneObjects(d.landZone)) do lands[o.getGUID()] = true end
+  end
+  local field = {}
+  for _, o in ipairs(pieces(d.playmat)) do
+    if o.type == 'Card' then
+      local g = o.getGUID()
+      field[#field + 1] = { guid = g, type = 'Card', nick = o.getName(), desc = o.getDescription(),
+        tapped = isTapped(o, d.playmat), faceDown = isFaceDown(o), row = lands[g] and 'land' or nil }
+    end
+  end
+  return { seat = seat, battlefield = field, cards = ops.hand(req).cards }
 end
 
 local function yawOf(zone) return zone.getRotation().y end
@@ -1697,6 +2438,26 @@ local function rowSpec(d, row)
   return { rows = { front + 2 * step }, cols = cols }
 end
 
+-- for table_layout: each row's slot count and the slots furniture blocks
+-- (strings, not tables: TTS drops payloads holding an empty table)
+function slotReport(d)
+  local out = {}
+  for _, row in ipairs({ 'land', 'creature', 'other' }) do
+    local spec = rowSpec(d, row)
+    local blocked = {}
+    for i, a in ipairs(spec.rows) do
+      for j, c in ipairs(spec.cols) do
+        if blockedByFurniture(d.playmat, a, c, CARD_H / 2, CARD_W / 2) then
+          blocked[#blocked + 1] = string.format('r%d c%d (%.1f, %.1f)', i, j, a, c)
+        end
+      end
+    end
+    out[row] = { slots = #spec.rows * #spec.cols, blocked = #blocked > 0 and table.concat(blocked, '; ') or 'none' }
+  end
+  out.furniture = #matFurniture(d.playmat)
+  return out
+end
+
 -- where the stack (announced spells, reveals) goes; offset in columns
 local function stackPoint(d, offset)
   local spec = rowSpec(d, 'stack')
@@ -1730,6 +2491,7 @@ local function rowSlot(d, row)
   local function free(a, r, layer)
     -- layer 0: nothing inside the slot's footprint; overlap layers: nothing
     -- sitting on that exact offset spot yet
+    if blockedByFurniture(d.playmat, a, r, CARD_H / 2, CARD_W / 2) then return false end
     local da, dr = CARD_H / 2, COL_SPACING / 2
     if layer > 0 then da, dr = 0.45, 0.45 end
     for _, t in ipairs(taken) do
@@ -1819,6 +2581,43 @@ local function faceUpAt(obj, pos, yaw)
   obj.setRotationSmooth({ 0, yaw, 0 }, false, true)
 end
 
+-- An optional request field: the server sends '' for "not given", and '' is
+-- truthy in Lua, so `req.row or 'creature'` gave '' (creature tokens went to
+-- the 'other' row).
+function optArg(v, default)
+  if v == nil or v == '' then return default end
+  return v
+end
+
+-- Deal into the main hand. On the 4-seat tables TTS sometimes put a dealt card
+-- in the secondary hand (2026-10-30 game), so ask for hand 1 and, once the
+-- cards have landed, move any newcomer there to hand 1. Cards `look` put in
+-- the secondary hand stay.
+local function dealToHand(obj, n, seat)
+  local before = {}
+  for _, h in ipairs(handZones(seat)) do
+    if h.idx > 1 then
+      for _, o in ipairs(handObjects(seat, h.idx)) do before[o.getGUID()] = true end
+    end
+  end
+  obj.deal(n, seat, 1)
+  Wait.time(function()
+    local ok, tr = pcall(function() return Player[seat].getHandTransform(1) end)
+    if not ok or not tr or not tr.position then return end
+    for _, h in ipairs(handZones(seat)) do
+      if h.kind == 'secondary' then
+        for _, o in ipairs(handObjects(seat, h.idx)) do
+          local g = o.getGUID()
+          if not before[g] and not state.looked[g] then
+            state.touched[g] = Time.time
+            o.setPosition({ tr.position.x, tr.position.y + 1, tr.position.z })
+          end
+        end
+      end
+    end
+  end, 1.5)
+end
+
 function ops.draw(req)
   local seat, d = myData()
   local n = tonumber(req.n) or 1
@@ -1830,9 +2629,9 @@ function ops.draw(req)
   local delay = math.max(0, (state.libBusyUntil or 0) - Time.time)
   state.dealingUntil = Time.time + delay + 3 -- the dealt cards are mine: no zone events
   if delay > 0 then
-    Wait.time(function() local l = libraryTop(d); if l then l.deal(n, seat) end end, delay)
+    Wait.time(function() local l = libraryTop(d); if l then dealToHand(l, n, seat) end end, delay)
   else
-    lib.deal(n, seat)
+    dealToHand(lib, n, seat)
   end
   return { drew = n, libraryLeft = avail - n }
 end
@@ -1859,7 +2658,7 @@ function ops.mulligan(req)
     local deck = libraryTop(d)
     if deck then
       deck.shuffle()
-      Wait.time(function() deck.deal(7, seat) end, 0.6)
+      Wait.time(function() dealToHand(deck, 7, seat) end, 0.6)
     end
   end, 0.8)
   return { returned = #hand, drawing = 7 }
@@ -1870,11 +2669,11 @@ end
 function ops.play(req)
   local seat, d = myData()
   local obj, from = myObject(seat, d, req.guid)
-  local row = req.row or 'other'
+  local row = optArg(req.row, 'other')
   if row ~= 'land' and row ~= 'creature' and row ~= 'other' and row ~= 'stack' then error('row must be land/creature/other/stack') end
   local pos = (row == 'stack') and stackPoint(d) or rowSlot(d, row)
   faceUpAt(obj, pos, yawOf(d.playmat))
-  return { played = obj.getName(), from = from, row = row, guid = obj.getGUID() }
+  return { played = obj.getName(), desc = obj.getDescription(), from = from, row = row, guid = obj.getGUID() }
 end
 
 local function setTapped(d, obj, tapped)
@@ -1884,16 +2683,68 @@ local function setTapped(d, obj, tapped)
   obj.setRotationSmooth({ r.x, yaw, r.z }, false, true)
 end
 
+-- True when a mana ability of the card sacrifices it ("{T}, Sacrifice this
+-- token: Add...", "Sacrifice Lotus Petal: Add..."). A quoted ability it grants
+-- to others (Goldspan Dragon's Treasures) does not count.
+-- The colon is found with a plain find: '^(.-):' on a long line without one
+-- ("As this land enters, you may reveal ...") is "pattern too complex" in TTS.
+local function sacrificedForMana(nick, desc)
+  local name = string.lower((nick or ''):match('^[^\n]*') or '')
+  for line in string.gmatch(string.lower(desc or ''), '[^\n]+') do
+    local colon = string.find(line, ':', 1, true)
+    local cost = colon and string.sub(line, 1, colon - 1)
+    local effect = colon and (string.gsub(string.sub(line, colon + 1), '^%s+', ''))
+    if cost and effect:find('^add') and not cost:find('"', 1, true)
+        and (cost:find('sacrifice this', 1, true) or (name ~= '' and cost:find('sacrifice ' .. name, 1, true))) then
+      return true
+    end
+  end
+  return false
+end
+
+-- A token: the encoder says so, or the card's type line (the nickname's second
+-- line, "Treasure\nToken Artifact") does.
+local function isTokenCard(obj)
+  local info = encoderInfo(obj) or {}
+  local nick = obj.getName()
+  return info.token or string.find(string.lower(nick:match('\n([^\n]*)') or ''), 'token', 1, true) ~= nil
+end
+
+-- req.mana: the cards pay for a spell, so a Treasure-like source is sacrificed
+-- instead of tapped. A token ceases to exist, a card goes to the graveyard, and
+-- one card standing for N tokens (spawn_token count=N) drops to N-1.
 function ops.tap(req)
   local seat, d = myData()
-  local done = {}
+  local done, sacrificed, warn = {}, {}, nil
   for _, g in ipairs(req.guids or {}) do
     local obj, from = myObject(seat, d, g)
     if from ~= 'playmat' then error(obj.getName() .. ' is not on my battlefield') end
-    setTapped(d, obj, true)
-    done[#done + 1] = obj.getName()
+    local nick = obj.getName()
+    local name = nick:match('^[^\n]*') or nick
+    local sacMana = sacrificedForMana(nick, obj.getDescription())
+    if sacMana and not req.mana then
+      warn = name .. ' was only tapped: if it paid for mana, tap it with mana=true so it is sacrificed'
+    end
+    if req.mana and sacMana then
+      local info = encoderInfo(obj) or {}
+      local n = tonumber(info.counters) or 0
+      local isToken = isTokenCard(obj)
+      if n > 1 then
+        ops.mark({ guid = g, counters = -1, note = string.format('%d %s tokens', n - 1, name) })
+        sacrificed[#sacrificed + 1] = string.format('one %s (%d left on [%s])', name, n - 1, g)
+      elseif isToken then
+        obj.destruct()
+        sacrificed[#sacrificed + 1] = name .. ' (token, gone)'
+      else
+        ops.move({ guid = g, to = 'graveyard' })
+        sacrificed[#sacrificed + 1] = name .. ' (to graveyard)'
+      end
+    else
+      setTapped(d, obj, true)
+      done[#done + 1] = nick
+    end
   end
-  return { tapped = done }
+  return { tapped = done, sacrificed = sacrificed, warning = warn }
 end
 
 function ops.untap(req)
@@ -1980,6 +2831,29 @@ function ops.move(req)
   local to = req.to
   local yaw = yawOf(d.playmat)
   local name = obj.getName()
+  local short = name:match('^[^\n]*') or name
+  local offField = to == 'graveyard' or to == 'exile' or to == 'hand' or to == 'library_top' or to == 'library_bottom'
+  -- a token leaving the battlefield ceases to exist
+  if offField and isTokenCard(obj) then
+    obj.destruct()
+    return { moved = name, from = from, to = to, note = short .. ' is a token: it ceased to exist' }
+  end
+  -- a card another player put on my mat (they gave it to me, or cast it
+  -- there) goes to its owner's zones, not mine
+  local owner = state.playBy[obj.getGUID()]
+  local od = owner and seatData(owner)
+  if offField and od then
+    if to == 'graveyard' or to == 'exile' then
+      local z = to == 'graveyard' and od.graveyard or od.exileZone
+      if z == nil then error(short .. ' belongs to ' .. owner .. ', whose ' .. to .. ' I cannot find: ask them to take it') end
+      local p = z.getPosition()
+      faceUpAt(obj, { p.x, p.y + 2, p.z }, to == 'exile' and (od.exileYaw or yawOf(z)) or yawOf(z))
+      state.playBy[obj.getGUID()] = nil
+      broadcastToAll('[' .. NAME .. '] ' .. short .. ' goes to ' .. owner .. "'s " .. to .. ' (their card)', Color.fromString(seat))
+      return { moved = name, from = from, to = owner .. "'s " .. to }
+    end
+    error(short .. ' belongs to ' .. owner .. ': ask them to put it in their ' .. (to == 'hand' and 'hand' or 'library'))
+  end
   if to == 'graveyard' then
     local p = d.graveyard.getPosition(); faceUpAt(obj, { p.x, p.y + 2, p.z }, yawOf(d.graveyard))
   elseif to == 'exile' then
@@ -1988,11 +2862,11 @@ function ops.move(req)
     local p = d.commandSpot or d.commandZone.getPosition(); faceUpAt(obj, { p.x, p.y + 2, p.z }, yawOf(d.commandZone))
   elseif to == 'hand' then
     state.touched[obj.getGUID()] = Time.time
-    obj.deal(1, seat)
+    dealToHand(obj, 1, seat)
   elseif to == 'stack' then
     faceUpAt(obj, stackPoint(d), yaw)
   elseif to == 'battlefield' then
-    faceUpAt(obj, rowSlot(d, req.row or 'other'), yaw)
+    faceUpAt(obj, rowSlot(d, optArg(req.row, 'other')), yaw)
   elseif to == 'library_top' or to == 'library_bottom' then
     -- Library moves are queued: a bottom move flips the deck for about a
     -- second, and a second move landing inside that window put its card on
@@ -2072,23 +2946,43 @@ function ops.search(req)
   local q = string.lower(tostring(req.query or ''))
   if q == '' then error('query required') end
   local n = tonumber(req.n) or 1
-  local to = req.to or 'battlefield'
+  local to = optArg(req.to, 'battlefield')
   -- plain-name cards (other importers): name is the card name, description is
   -- "{cost}\nType line\n\nOracle text". Match name + the header lines
   -- (everything before the first blank line) unless req.desc asks for all.
+  -- Nicknames that carry the type line ("Krosan Verge\nLand 0CMC") come with a
+  -- description that is only rules text: leave it out, or a Forest search
+  -- takes Krosan Verge for its "search for a Forest card".
   local function haystack(name, desc)
     local dsc = desc or ''
-    if not req.desc then dsc = descHeader(dsc) end
+    if not req.desc then
+      if string.find(name or '', '\n', 1, true) then dsc = '' else dsc = descHeader(dsc) end
+    end
     return string.lower(name or '') .. '\n' .. string.lower(dsc)
+  end
+  -- basic: the type line must say Basic Land (a Forest search otherwise takes
+  -- Breeding Pool, whose type line is Land — Forest Island)
+  -- every word must appear, in any order: 'basic land forest' finds a Forest
+  -- whose type line reads Basic Land — Forest
+  local function hit(name, desc)
+    local h = haystack(name, desc)
+    if not string.find(h, q, 1, true) then
+      for w in string.gmatch(q, '%S+') do
+        if not string.find(h, w, 1, true) then return false end
+      end
+    end
+    if not req.basic then return true end
+    local head = string.lower(name or '') .. '\n' .. string.lower(descHeader(desc or ''))
+    return string.find(head, 'basic land', 1, true) ~= nil
   end
   local function matching()
     local out = {}
     if lib.type == 'Deck' then
       -- cards still inside an imported deck have no GUIDs: take by index
       for _, c in ipairs(lib.getObjects()) do
-        if string.find(haystack(c.name, c.description), q, 1, true) then out[#out + 1] = c end
+        if hit(c.name, c.description) then out[#out + 1] = c end
       end
-    elseif string.find(haystack(lib.getName(), lib.getDescription()), q, 1, true) then
+    elseif hit(lib.getName(), lib.getDescription()) then
       out[1] = { index = 0, name = lib.getName() }
     end
     return out
@@ -2108,9 +3002,9 @@ function ops.search(req)
     if c then
       state.touched[c.getGUID()] = Time.time
       if to == 'hand' then
-        c.deal(1, seat)
+        dealToHand(c, 1, seat)
       else
-        c.setPosition(rowSlot(d, req.row or 'other'))
+        c.setPosition(rowSlot(d, optArg(req.row, 'other')))
         c.setRotation({ 0, yawOf(d.playmat) + (req.tapped and 90 or 0), 0 })
       end
       taken[#taken + 1] = { guid = c.getGUID(), nick = c.getName(), desc = c.getDescription() }
@@ -2272,9 +3166,9 @@ function ops.reset_board(req)
     end
   end
   for _, k in ipairs({ 'libraryZone', 'graveyard', 'exileZone', 'commandZone' }) do
-    if d[k] then wipe(d[k].getObjects(), true) end
+    if d[k] then wipe(zoneObjects(d[k]), true) end
   end
-  if d.playmat then wipe(d.playmat.getObjects(), false) end
+  if d.playmat then wipe(zoneObjects(d.playmat), false) end
   for _, h in ipairs(handZones(seat)) do wipe(handObjects(seat, h.idx), true) end
   if d.adapted then
     -- this table has no reset of its own: life back to 40, tally cleared
@@ -2444,7 +3338,8 @@ end
 function ops.token(req)
   local _, d = myData()
   if type(req.json) ~= 'string' then error('json required') end
-  local pos = rowSlot(d, req.row or 'creature')
+  local row = optArg(req.row, 'creature')
+  local pos = rowSlot(d, row)
   local o = spawnObjectJSON({ json = req.json, position = pos, rotation = { 0, yawOf(d.playmat), 0 } })
   if o then state.touched[o.getGUID()] = Time.time end
   return { guid = o and o.getGUID() or nil }
@@ -2569,6 +3464,7 @@ end
 -- first") never went through the marker, and end_turn needs to know
 function ops.start_turn(req)
   requireSeat()
+  if state.draft and state.draft.phase == 'done' then endDraft() end
   if state.claudeTurn then return { started = false, already = true } end
   startClaudeTurn(Turns.turn_color)
   return { started = true }
@@ -2603,7 +3499,7 @@ state.taps = {}
 function pollTaps()
   local w = state.tapWatch
   local seat = Turns.turn_color
-  if state.seat == nil or state.claudeTurn or not Turns.enable or seat == nil or seat == '' or seat == state.seat then
+  if state.seat == nil or state.draft or state.claudeTurn or not Turns.enable or seat == nil or seat == '' or seat == state.seat then
     w.seat = nil
     return
   end
@@ -2611,7 +3507,7 @@ function pollTaps()
   if d == nil or d.playmat == nil then return end
   if w.seat ~= seat then w.seat = seat; w.untapped = {} end
   local land = {}
-  if d.landZone then for _, o in ipairs(d.landZone.getObjects()) do land[o.getGUID()] = true end end
+  if d.landZone then for _, o in ipairs(zoneObjects(d.landZone)) do land[o.getGUID()] = true end end
   local newly = {}
   for _, o in ipairs(pieces(d.playmat)) do
     local g = o.getGUID()
@@ -2643,8 +3539,95 @@ function pollTaps()
     if cur ~= b or cur.t ~= stamp then return end -- more taps came in
     state.taps[seat] = nil
     local pl = Player[seat]
-    emit({ ev = 'attack', color = seat, player = pl and pl.steam_name or '', cards = JSON.encode(b.cards) })
+    local cards = JSON.encode(b.cards)
+    -- at the AI only with the attack pad lit, or when the AI is the
+    -- attacker's one opponent; otherwise kept in case the press comes late
+    local call = state.attackCall
+    local pressed = call ~= nil and call.color == seat
+    local others = 0
+    for _, c in ipairs(seatedHumans()) do if c ~= seat and not seatSkipped(c) then others = others + 1 end end
+    if pressed then call.reported = true end
+    if not pressed then state.lastAttack = { seat = seat, cards = cards, t = Time.time } end
+    emit({ ev = 'attack', color = seat, player = pl and pl.steam_name or '', cards = cards,
+      onMe = pressed or others == 0, pressed = pressed, headsUp = others == 0 })
   end, 3)
+end
+
+-- The mana trackers: tables like "MTG EDH 4-player (S)" have a counter per
+-- colour (White Mana ... Colorless Mana) by each land row. The pad keeps the
+-- AI's showing what its untapped sources could make, so the table can see
+-- what it has up: a dual land counts for both its colours, "any color" for
+-- all five, Sol Ring for two colorless. Checked every few seconds, written
+-- only when a number changes.
+local MANA_COUNTERS = { W = 'White Mana', U = 'Blue Mana', B = 'Black Mana', R = 'Red Mana', G = 'Green Mana', C = 'Colorless Mana' }
+
+-- what one untapped permanent could add, by colour
+function manaOf(desc)
+  local out = {}
+  for clause in tostring(desc or ''):gmatch('{T}: Add ([^.\n]*)') do
+    local lower = clause:lower()
+    if lower:find('any color') or lower:find('any one color') then
+      for _, k in ipairs({ 'W', 'U', 'B', 'R', 'G' }) do out[k] = math.max(out[k] or 0, 1) end
+    elseif lower:find(' or ') then
+      for k in clause:gmatch('{([WUBRGC])}') do out[k] = math.max(out[k] or 0, 1) end
+    else
+      local n = {}
+      for k in clause:gmatch('{([WUBRGC])}') do n[k] = (n[k] or 0) + 1 end
+      for k, v in pairs(n) do out[k] = math.max(out[k] or 0, v) end
+    end
+  end
+  return out
+end
+
+-- the seat's own counters: the nearest of each name, beside its mat
+local function manaCounters(seat, d)
+  state.manaCounters = state.manaCounters or {}
+  local c = state.manaCounters[seat]
+  if c and c.W ~= nil and getObjectFromGUID(c.W) then return c end
+  local half = d.playmat.getScale().x / 2
+  c = {}
+  for _, o in ipairs(getAllObjects()) do
+    local name = o.getName()
+    for k, want in pairs(MANA_COUNTERS) do
+      if name == want then
+        local along, right = matLocal(d.playmat, o.getPosition())
+        local dist = along * along + right * right
+        if math.abs(along) <= 15 and math.abs(right) <= half + 4 and (c[k] == nil or dist < c[k .. 'd']) then
+          c[k], c[k .. 'd'] = o.getGUID(), dist
+        end
+      end
+    end
+  end
+  state.manaCounters[seat] = c
+  return c
+end
+
+function pollMana()
+  if state.seat == nil or state.stopped or state.draft then return end
+  local d = seatData(state.seat)
+  if d == nil or d.playmat == nil then return end
+  local counters = manaCounters(state.seat, d)
+  if counters.W == nil then return end -- this table has no mana trackers
+  local total = { W = 0, U = 0, B = 0, R = 0, G = 0, C = 0 }
+  for _, o in ipairs(pieces(d.playmat)) do
+    if o.type == 'Card' and not isFaceDown(o) and not isTapped(o, d.playmat) then
+      for k, v in pairs(manaOf(o.getDescription())) do total[k] = total[k] + v end
+    end
+  end
+  state.manaShown = state.manaShown or {}
+  for k, v in pairs(total) do
+    local g = counters[k]
+    if g and state.manaShown[k] ~= v then
+      local o = getObjectFromGUID(g)
+      if o then
+        pcall(function()
+          o.setVar('val', v)
+          o.call('updateVal')
+        end)
+        state.manaShown[k] = v
+      end
+    end
+  end
 end
 
 -- what is already on each battlefield when the pad loads is not a new play
@@ -2657,4 +3640,966 @@ function seedField()
       end
     end
   end
+end
+
+---------------------------------------------------------------------------
+-- drafting
+---------------------------------------------------------------------------
+-- Booster draft (one pick a pass), pick-two (two a pass, for 3 or 4
+-- drafters) and Winston (two drafters). The pad deals and passes every pack
+-- itself, through the hand zones: a pack in your hand is seen by you alone,
+-- which is TTS's own privacy. A set's boosters come from the importer's own
+-- /draft (real collation, three per drafter); a cube's packs are decided
+-- here. Either way nemesis-mcp only learns the set or cube list and the
+-- cards that reach the AI's own hand or pool.
+--   booster / pick-two: every drafter gets a pack in hand. A human picks by
+--     taking cards out of their hand (face-down onto their mat), the AI with
+--     draft_pick. Once everyone has picked, every pack moves on at once:
+--     packs 1 and 3 in seat order, pack 2 the other way.
+--   winston: the stack and three piles sit between the two drafters. The
+--     drafter on turn looks at pile 1 (a human gets it in hand) and takes it
+--     or passes it: a passed pile gets the stack's top card and the next pile
+--     is looked at; passing pile 3 takes the stack's top card blind.
+-- The AI's picks go face-down to its pool on its mat. While a draft is on
+-- the table the pad reports no plays or zone moves (picks would read as
+-- casts), until the first game turn after it.
+
+local function draftKey(name)
+  local n = (tostring(name or ''):match('^[^\n]*') or ''):lower()
+  n = n:gsub('%s*//.*$', '')
+  n = n:gsub('^%s+', '')
+  n = n:gsub('%s+$', '')
+  return n
+end
+
+local function shuffled(list)
+  local t = {}
+  for i, v in ipairs(list) do t[i] = v end
+  for i = #t, 2, -1 do
+    local j = math.random(i)
+    t[i], t[j] = t[j], t[i]
+  end
+  return t
+end
+
+-- cards and decks resting on a spot (packs, piles, the pool)
+local function cardsAt(pos, radius)
+  local out = {}
+  local rad = radius or 1.5
+  for _, o in ipairs(getAllObjects()) do
+    if (o.type == 'Card' or o.type == 'Deck') and not o.getLock() then
+      local p = o.getPosition()
+      if math.abs(p.x - pos.x) < rad and math.abs(p.z - pos.z) < rad then out[#out + 1] = o end
+    end
+  end
+  return out
+end
+
+local function countAt(pos)
+  local n = 0
+  for _, o in ipairs(cardsAt(pos)) do n = n + (o.type == 'Deck' and o.getQuantity() or 1) end
+  return n
+end
+
+-- name, text and guid of every card on a spot (a deck's cards without
+-- taking them out)
+local function listAt(pos)
+  local out = {}
+  for _, o in ipairs(cardsAt(pos)) do
+    if o.type == 'Deck' then
+      for _, c in ipairs(o.getObjects()) do out[#out + 1] = { guid = c.guid, nick = c.name, desc = c.description } end
+    else
+      out[#out + 1] = { guid = o.getGUID(), nick = o.getName(), desc = o.getDescription() }
+    end
+  end
+  return out
+end
+
+local function faceDownYaw(yaw) return { 0, yaw, 180 } end
+
+-- every card on a spot, one by one, to place.pos(i) turned place.rot, then
+-- place.done(card) (decks are taken apart; a deck's last card is its
+-- remainder)
+local function eachCardAt(pos, place)
+  local i = 0
+  for _, o in ipairs(cardsAt(pos)) do
+    if o.type == 'Deck' then
+      local deck = o
+      local n = deck.getQuantity()
+      for _ = 1, n do
+        i = i + 1
+        if deck.type == 'Deck' then
+          local c = deck.takeObject({ position = place.pos(i), rotation = place.rot, smooth = false })
+          if deck.remainder ~= nil then deck = deck.remainder end
+          if c then place.done(c) end
+        else
+          deck.setRotation(place.rot)
+          deck.setPosition(place.pos(i))
+          place.done(deck)
+        end
+      end
+    else
+      i = i + 1
+      o.setRotation(place.rot)
+      o.setPosition(place.pos(i))
+      place.done(o)
+    end
+  end
+end
+
+local function handSpot(color)
+  local tr = Player[color].getHandTransform(1)
+  return tr.position, tr.rotation
+end
+
+-- deal whatever sits on `pos` into a seat's hand; returns the cards' guids
+local function spotToHand(pos, color)
+  local hp, hr = handSpot(color)
+  local guids = {}
+  eachCardAt(pos, {
+    pos = function(i) return { hp.x, hp.y + 0.3 + i * 0.05, hp.z } end,
+    rot = { 0, hr.y + 180, 0 },
+    done = function(c) state.touched[c.getGUID()] = Time.time; guids[#guids + 1] = c.getGUID() end,
+  })
+  return guids
+end
+
+-- move cards (by guid, wherever they are) face-down onto a spot
+local function guidsToSpot(guids, pos, yaw)
+  local base = countAt(pos)
+  for i, g in ipairs(guids) do
+    local o = getObjectFromGUID(g)
+    if o then
+      state.touched[g] = Time.time
+      o.setRotation(faceDownYaw(yaw))
+      o.setPosition({ pos.x, pos.y + 0.4 + (base + i) * 0.05, pos.z })
+    end
+  end
+end
+
+local function inHandSet(color)
+  local s = {}
+  for _, h in ipairs(handZones(color)) do
+    if h.kind ~= 'tokens' then
+      for _, o in ipairs(handObjects(color, h.idx)) do s[o.getGUID()] = true end
+    end
+  end
+  return s
+end
+
+-- spots: a seat's packs on the row nearest the centre, the AI's pool on its
+-- 'other' row, the Winston stack and piles between the two drafters
+local function packSpot(color, r, rounds)
+  local d = seatData(color)
+  local off = (r - (rounds + 1) / 2) * 3.4
+  return matPoint(d, rowSpec(d, 'creature').rows[1], off, d.playmat.getPosition().y + 0.6)
+end
+
+local function poolSpot()
+  local d = seatData(state.seat)
+  return matPoint(d, rowSpec(d, 'other').rows[1], 0, d.playmat.getPosition().y + 0.6)
+end
+
+-- The row's centre starts halfway between the mats' midpoint and the
+-- table's centre (for two drafters facing each other, the seam between
+-- their mats) and moves 4 towards the middle of the AI's own mat: cards
+-- left on the seam slid off their spots and the pad lost the stack.
+local function winstonSpots(a, b)
+  local pa, pb = seatData(a).playmat.getPosition(), seatData(b).playmat.getPosition()
+  local mid = { x = (pa.x + pb.x) / 4, y = math.max(pa.y, pb.y) + 0.6, z = (pa.z + pb.z) / 4 }
+  local own = seatData(state.seat).playmat.getPosition()
+  local ox, oz = own.x - mid.x, own.z - mid.z
+  local olen = math.sqrt(ox * ox + oz * oz)
+  if olen > 0.01 then mid.x, mid.z = mid.x + ox / olen * 4, mid.z + oz / olen * 4 end
+  local dx, dz = pb.x - pa.x, pb.z - pa.z
+  local len = math.sqrt(dx * dx + dz * dz)
+  if len < 0.01 then dx, dz, len = 1, 0, 1 end
+  local rx, rz = -dz / len, dx / len -- across the line between the two mats
+  local function at(k) return { x = mid.x + rx * k * 3, y = mid.y, z = mid.z + rz * k * 3 } end
+  return { stack = at(-1.5), piles = { at(-0.5), at(0.5), at(1.5) } }
+end
+
+-- for ops defined above the drafting section
+function winstonSpotsFor(a, b) return winstonSpots(a, b) end
+
+local function toPool(guids)
+  guidsToSpot(guids, poolSpot(), yawOf(seatData(state.seat).playmat))
+end
+
+local function draftSay(msg) broadcastToAll('[Nemesis] ' .. msg, { 0.85, 0.75, 1 }) end
+
+local function tellColor(color, msg, rgb)
+  pcall(function() broadcastToColor('[Nemesis] ' .. msg, color, rgb or { 0.85, 0.75, 1 }) end)
+end
+
+-- a cube's packs: names only, decided here, dealt without replacement
+local function makePacks(req, n, size)
+  local deck = shuffled(req.cube or {})
+  if #deck < n * size then error('the cube has ' .. #deck .. ' cards; ' .. n .. ' packs of ' .. size .. ' need ' .. n * size) end
+  local packs = {}
+  for p = 1, n do
+    local pack = {}
+    for i = 1, size do pack[i] = deck[(p - 1) * size + i] end
+    packs[p] = pack
+  end
+  return packs
+end
+
+-- No pick: the token cards the importer adds for every card that makes
+-- tokens, and the basic lands in a play booster's land slot (the table has
+-- a box of basics; deck building adds them for free). Dual lands stay.
+local function isNoPick(nick)
+  local typeLine = tostring(nick or ''):match('\n([^\n]*)') or ''
+  return typeLine:find('Token') ~= nil or (typeLine:find('Basic') ~= nil and typeLine:find('Land') ~= nil)
+end
+
+-- take the no-pick cards out of spawned decks and cards, and destroy them
+local function stripTokens(objs)
+  local n = 0
+  for _, o in ipairs(objs) do
+    if not o.isDestroyed() then
+      if o.type == 'Deck' then
+        local deck = o
+        for _, c in ipairs(o.getObjects()) do
+          if isNoPick(c.name) and deck.type == 'Deck' then
+            local p = deck.getPosition()
+            local t = deck.takeObject({ guid = c.guid, position = { p.x, p.y + 3, p.z }, smooth = false })
+            if deck.remainder ~= nil then deck = deck.remainder end
+            if t then destroyObject(t); n = n + 1 end
+          end
+        end
+      elseif isNoPick(o.getName()) then
+        destroyObject(o); n = n + 1
+      end
+    end
+  end
+  return n
+end
+
+-- A set's boosters, made by the importer itself (its /draft follows each
+-- set's real collation): three packs per hand, each a deck nicknamed
+-- 'Player N - Pack R'. Pack R of drafter N is spawned face-down at
+-- spot(N, R); fn(spawned, issues) once they have settled. extra asks for
+-- that many more hands' worth (Winston needs more than two drafters' packs).
+local function importBoosters(url, set, seats, spot, yaw, fn, extra)
+  local hands = {}
+  for i = 1, #seats + (extra or 0) do
+    local c = seats[((i - 1) % #seats) + 1]
+    local tr = Player[c].getHandTransform(1)
+    hands[#hands + 1] = { position = tr.position, forward = tr.forward, right = tr.right }
+  end
+  local body = JSON.encode({ set = set, hands = hands, useStates = true })
+  WebRequest.custom(url .. '/draft', 'POST', true, body, {
+    ['Content-Type'] = 'application/json', Accept = 'application/x-ndjson',
+    ['X-Client-Version'] = 'Nemesis/' .. NEMESIS_VERSION,
+  }, function(resp)
+    if resp.error ~= nil then
+      local msg = tostring(resp.error)
+      local ok, e = pcall(function() return JSON.decode(resp.text) end)
+      if ok and type(e) == 'table' and e.error then msg = e.error end
+      fn(nil, { msg })
+      return
+    end
+    local spawned, issues, k = {}, {}, 0
+    for line in string.gmatch(resp.text, '[^\r\n]+') do
+      if string.sub(line, 1, 9) == '{"error":' then
+        local ok, e = pcall(function() return JSON.decode(line) end)
+        if ok and e.error then issues[#issues + 1] = e.error end
+      else
+        k = k + 1
+        local who, r = line:match('"Nickname":"Player (%d+) %- Pack (%d+)"')
+        local at = spot(tonumber(who) or 1, tonumber(r) or 1)
+        local o = spawnObjectJSON({ json = line, position = { at.x, at.y + 1 + k * 0.4, at.z }, rotation = faceDownYaw(yaw(tonumber(who) or 1)) })
+        if o then state.touched[o.getGUID()] = Time.time; spawned[#spawned + 1] = o end
+      end
+    end
+    Wait.condition(function() fn(spawned, issues) end, function()
+      for _, o in ipairs(spawned) do
+        if not o.isDestroyed() and (o.spawning or not o.resting) then return false end
+      end
+      return true
+    end, 20, function() fn(spawned, issues) end)
+  end)
+end
+
+-- build a list of names on the importer, spawn it face-down at `at`, then
+-- call fn(spawned objects, problems) once they have settled
+local function importNames(url, names, at, yaw, fn)
+  local counts, order = {}, {}
+  for _, n in ipairs(names) do
+    if counts[n] == nil then order[#order + 1] = n; counts[n] = 0 end
+    counts[n] = counts[n] + 1
+  end
+  local lines = {}
+  for _, n in ipairs(order) do lines[#lines + 1] = counts[n] .. ' ' .. n end
+  local body = JSON.encode({ data = table.concat(lines, '\n'), useStates = true, preferOriginalPrinting = false,
+    hand = Player[state.seat].getHandTransform(1) })
+  WebRequest.custom(url .. '/build', 'POST', true, body, {
+    ['Content-Type'] = 'application/json', Accept = 'application/x-ndjson',
+    ['X-Client-Version'] = 'Nemesis/' .. NEMESIS_VERSION,
+  }, function(resp)
+    if resp.error ~= nil then fn(nil, { tostring(resp.error) }) return end
+    local spawned, issues, k = {}, {}, 0
+    for line in string.gmatch(resp.text, '[^\r\n]+') do
+      if string.sub(line, 1, 9) == '{"error":' then
+        local ok, e = pcall(function() return JSON.decode(line) end)
+        if ok and e.error then issues[#issues + 1] = e.error end
+      else
+        k = k + 1
+        local o = spawnObjectJSON({ json = line, position = { at.x, at.y + 2 + k * 0.6, at.z }, rotation = faceDownYaw(yaw) })
+        if o then state.touched[o.getGUID()] = Time.time; spawned[#spawned + 1] = o end
+      end
+    end
+    Wait.condition(function() fn(spawned, issues) end, function()
+      for _, o in ipairs(spawned) do
+        if not o.isDestroyed() and (o.spawning or not o.resting) then return false end
+      end
+      return true
+    end, 20, function() fn(spawned, issues) end)
+  end)
+end
+
+-- split a seat's spawned pool into its packs by name, one spot per pack;
+-- returns how many cards the importer did not build
+local function splitPacks(spawned, packs, spots, yaw)
+  local byName = {}
+  local function push(key, e) byName[key] = byName[key] or {}; table.insert(byName[key], e) end
+  for _, o in ipairs(spawned) do
+    if not o.isDestroyed() then
+      if o.type == 'Deck' then
+        local src = { obj = o }
+        for _, c in ipairs(o.getObjects()) do push(draftKey(c.name), { src = src, guid = c.guid }) end
+      else
+        push(draftKey(o.getName()), { card = o })
+      end
+    end
+  end
+  local short = 0
+  for p, names in ipairs(packs) do
+    local spot = spots[p]
+    for i, n in ipairs(names) do
+      local list = byName[draftKey(n)]
+      local e = list and table.remove(list, 1)
+      local pos = { spot.x, spot.y + 0.4 + i * 0.05, spot.z }
+      if e == nil then
+        short = short + 1
+      elseif e.card then
+        e.card.setRotation(faceDownYaw(yaw)); e.card.setPosition(pos)
+      elseif e.src.obj.type == 'Deck' then
+        local c = e.src.obj.takeObject({ guid = e.guid, position = pos, rotation = faceDownYaw(yaw), smooth = false })
+        if e.src.obj.remainder ~= nil then e.src.obj = e.src.obj.remainder end
+        if c then state.touched[c.getGUID()] = Time.time end
+      else
+        e.src.obj.setRotation(faceDownYaw(yaw)); e.src.obj.setPosition(pos) -- the deck's last card
+      end
+    end
+  end
+  -- whatever the importer built on top (a second printing, a helper card)
+  -- would fall onto pack 1
+  for _, list in pairs(byName) do
+    for _, e in ipairs(list) do
+      local o = e.card or e.src.obj
+      if o and not o.isDestroyed() then pcall(function() destroyObject(o) end) end
+    end
+  end
+  return short
+end
+
+local function tidy(pos)
+  Wait.time(function()
+    local objs = cardsAt(pos)
+    if #objs > 1 then pcall(function() group(objs) end) end
+  end, 1.5)
+end
+
+function draftQuiet() return state.draft ~= nil end
+
+local FORMATS = { booster = 'Booster draft', pick_two = 'Pick-two draft', winston = 'Winston draft' }
+
+local function emitMyPack()
+  local dr = state.draft
+  local h = dr and dr.hands[state.seat]
+  if h == nil or #h.guids == 0 then return end
+  local list = {}
+  for _, g in ipairs(h.guids) do
+    local o = getObjectFromGUID(g)
+    if o then list[#list + 1] = { guid = g, nick = o.getName(), desc = o.getDescription() } end
+  end
+  emit({ ev = 'draft', what = 'pack', round = dr.round, rounds = dr.rounds, pick = dr.pick, need = h.need,
+    pool = countAt(poolSpot()), cards = JSON.encode(list) })
+end
+
+function openRound(r)
+  local dr = state.draft
+  dr.round, dr.pick, dr.dir, dr.hands, dr.waiting = r, 1, (r % 2 == 1) and 1 or -1, {}, {}
+  for _, c in ipairs(dr.seats) do
+    local guids = spotToHand(packSpot(c, r, dr.rounds), c)
+    dr.hands[c] = { guids = guids, need = math.min(dr.picks, #guids), since = Time.time }
+  end
+  local toward = dr.dir == 1 and dr.seats[2] or dr.seats[#dr.seats]
+  draftSay('Pack ' .. r .. ' of ' .. dr.rounds .. ': passing towards ' .. toward .. '.')
+  setStatus('Draft: pack ' .. r .. ', pick 1')
+  Wait.time(emitMyPack, 1)
+end
+
+local function finishDraft()
+  local dr = state.draft
+  dr.phase, dr.hands, dr.waiting, dr.view = 'done', {}, {}, nil
+  draftSay('The draft is over. Build a 40-card deck from your picks plus basic lands; the rest is your sideboard.')
+  setStatus('Draft over: deck building')
+  emit({ ev = 'draft', what = 'done', pool = countAt(poolSpot()) })
+end
+
+local function passPacks()
+  local dr = state.draft
+  local moves, total = {}, 0
+  for i, c in ipairs(dr.seats) do
+    local h = dr.hands[c]
+    local inHand = inHandSet(c)
+    local rest = {}
+    for _, g in ipairs(h and h.guids or {}) do if inHand[g] then rest[#rest + 1] = g end end
+    moves[dr.seats[((i - 1 + dr.dir) % #dr.seats) + 1]] = rest
+    total = total + #rest
+  end
+  dr.hands = {}
+  if total == 0 then
+    if dr.round >= dr.rounds then finishDraft() else openRound(dr.round + 1) end
+    return
+  end
+  dr.pick = dr.pick + 1
+  for to, rest in pairs(moves) do
+    local hp, hr = handSpot(to)
+    for k, g in ipairs(rest) do
+      local o = getObjectFromGUID(g)
+      if o then
+        state.touched[g] = Time.time
+        o.setRotation({ 0, hr.y + 180, 0 })
+        o.setPosition({ hp.x, hp.y + 0.3 + k * 0.05, hp.z })
+      end
+    end
+    dr.hands[to] = { guids = rest, need = math.min(dr.picks, #rest), since = Time.time }
+  end
+  setStatus('Draft: pack ' .. dr.round .. ', pick ' .. dr.pick)
+  Wait.time(emitMyPack, 1)
+end
+
+-- every 1.5 s: who has taken their pick(s) out of the pack in their hand?
+-- A human counts as done after two polls in a row with the right number out
+-- (a card dragged out to look at and put back is not a pick).
+function pollDraft()
+  local dr = state.draft
+  if dr == nil or dr.phase ~= 'picking' or dr.format == 'winston' then return end
+  local waiting = {}
+  for _, c in ipairs(dr.seats) do
+    local h = dr.hands[c]
+    if h and h.need > 0 then
+      local done = false
+      if Time.time - h.since > 2.5 then
+        local inHand = inHandSet(c)
+        local left = 0
+        for _, g in ipairs(h.guids) do if inHand[g] then left = left + 1 end end
+        local picked = #h.guids - left
+        h.ok = (picked == h.need) and (h.ok or 0) + 1 or 0
+        if picked > h.need and not h.warned and c ~= state.seat then
+          h.warned = true
+          tellColor(c, 'Take only ' .. h.need .. ' from this pack: put ' .. (picked - h.need) .. ' back in your hand.', { 1, 0.6, 0.4 })
+        end
+        done = h.ok >= ((c == state.seat) and 1 or 2)
+      end
+      if not done then waiting[#waiting + 1] = c end
+    end
+  end
+  local was = table.concat(dr.waiting or {}, ',')
+  dr.waiting = waiting
+  if #waiting == 0 then
+    passPacks()
+  elseif table.concat(waiting, ',') ~= was then
+    setStatus('Draft: pack ' .. dr.round .. ', pick ' .. dr.pick .. ' - waiting on ' .. table.concat(waiting, ', '))
+  end
+end
+
+-- Winston -------------------------------------------------------------------
+
+local function wSpots() local dr = state.draft return winstonSpots(dr.seats[1], dr.seats[2]) end
+local function wYaw() return yawOf(seatData(state.seat).playmat) end
+local function wOther(c) local dr = state.draft return dr.seats[1] == c and dr.seats[2] or dr.seats[1] end
+
+-- the stack's top card face-down onto a spot; nil when the stack is empty.
+-- A basic land or token that slipped past the strip at build time (the
+-- boosters were still merging) is destroyed and the next card dealt.
+local function wTopTo(pos)
+  for _ = 1, 20 do
+    local o = cardsAt(wSpots().stack)[1]
+    if o == nil then return nil end
+    local at = { pos.x, pos.y + 0.4 + countAt(pos) * 0.05, pos.z }
+    local c = o
+    if o.type == 'Deck' then
+      c = o.takeObject({ position = at, rotation = faceDownYaw(wYaw()), smooth = false })
+    else
+      o.setRotation(faceDownYaw(wYaw())); o.setPosition(at)
+    end
+    if c == nil then return nil end
+    if isNoPick(c.getName()) then
+      pcall(function() destroyObject(c) end)
+    else
+      state.touched[c.getGUID()] = Time.time
+      return c
+    end
+  end
+  return nil
+end
+
+local function wSizes()
+  local s = wSpots()
+  return { countAt(s.piles[1]), countAt(s.piles[2]), countAt(s.piles[3]) }, countAt(s.stack)
+end
+
+local function wNextPile(from)
+  local sizes = wSizes()
+  for i = from, 3 do if sizes[i] > 0 then return i end end
+  return nil
+end
+
+function wNextPileFor(from) return wNextPile(from) end
+
+-- quiet: the AI just passed and draft_pick already showed it the next pile
+local function wLook(quiet)
+  local dr = state.draft
+  if dr == nil or dr.phase ~= 'picking' then return end
+  local sizes, stack = wSizes()
+  if dr.turn == state.seat then
+    if quiet then setStatus('Winston: ' .. NAME .. ' looks at pile ' .. dr.pile) return end
+    emit({ ev = 'draft', what = 'winston', pile = dr.pile, sizes = table.concat(sizes, '/'), stack = stack,
+      pool = countAt(poolSpot()), cards = JSON.encode(listAt(wSpots().piles[dr.pile])) })
+    setStatus('Winston: ' .. NAME .. ' looks at pile ' .. dr.pile)
+  else
+    -- what the hand held before the pile came: a pass sends back everything
+    -- new, even a card whose guid the deal missed (a pile deck's last card)
+    local spot = wSpots().piles[dr.pile]
+    local n = countAt(spot)
+    dr.before = inHandSet(dr.turn)
+    dr.view = spotToHand(spot, dr.turn)
+    dr.viewN = n
+    local last = wNextPile(dr.pile + 1) == nil
+    pcall(function() showWinstonPad(dr.turn, dr.pile, n, last) end)
+    tellColor(dr.turn, 'Pile ' .. dr.pile .. ' (' .. n .. ' cards) is in your hand: say "take" or "pass" (or the pad buttons).')
+    setStatus('Winston: ' .. dr.turn .. ' looks at pile ' .. dr.pile)
+  end
+end
+
+local function wTurn(color)
+  local dr = state.draft
+  if dr == nil or dr.phase ~= 'picking' then return end
+  local _, stack = wSizes()
+  dr.turn, dr.view = color, nil
+  dr.pile = wNextPile(1)
+  if dr.pile == nil then
+    if stack == 0 then finishDraft(); buildControls(); return end
+    for i = 1, 3 do wTopTo(wSpots().piles[i]) end
+    dr.pile = 1
+  end
+  wLook()
+end
+
+function winstonBegin(issues)
+  local dr = state.draft
+  local s = wSpots()
+  for i = 1, 3 do wTopTo(s.piles[i]) end
+  dr.phase = 'picking'
+  local first = dr.seats[math.random(2)]
+  emit({ ev = 'draft', what = 'ready', format = 'winston', seats = table.concat(dr.seats, ', '), packs = 2 * dr.rounds, size = dr.size,
+    problems = table.concat(issues or {}, '; '), first = first })
+  draftSay('Winston draft: ' .. (countAt(s.stack) + 3) .. ' cards between ' .. dr.seats[1] .. ' and ' .. dr.seats[2] ..
+    '. On your turn the pile you look at goes to your hand: take it, or pass and it goes back with one more card. ' .. first .. ' starts.')
+  Wait.time(function() wTurn(first) end, 1)
+end
+
+-- the drafter on turn takes the pile they are looking at; returns the cards
+-- when it is the AI
+local function wTake(color)
+  local dr = state.draft
+  local s = wSpots()
+  local pile = dr.pile
+  local took, n
+  if color == state.seat then
+    took = listAt(s.piles[pile])
+    local p, yaw = poolSpot(), wYaw()
+    local base = countAt(p)
+    eachCardAt(s.piles[pile], {
+      pos = function(i) return { p.x, p.y + 0.4 + (base + i) * 0.05, p.z } end,
+      rot = faceDownYaw(yaw),
+      done = function(c) state.touched[c.getGUID()] = Time.time end,
+    })
+    n = #took
+  else
+    n = dr.viewN or #(dr.view or {})
+    dr.before = nil
+  end
+  dr.view = nil
+  Wait.time(function() wTopTo(s.piles[pile]) end, 0.3)
+  draftSay((color == state.seat and NAME or color) .. ' took pile ' .. pile .. ' (' .. n .. ' cards).')
+  if color ~= state.seat then emit({ ev = 'draft', what = 'took', color = color, pile = pile, n = n }) end
+  Wait.time(function() wTurn(wOther(color)) end, 1.2)
+  buildControls()
+  return took
+end
+
+-- the drafter on turn passes: the pile goes back with one more card, then
+-- the next pile, or after the last pile the top card of the stack, blind
+local function wPass(color)
+  local dr = state.draft
+  local s = wSpots()
+  local nxt = wNextPile(dr.pile + 1)
+  local _, stack = wSizes()
+  if nxt == nil and stack == 0 then error('this is the last pile and the stack is empty: take it') end
+  if color ~= state.seat then
+    local back, seen = {}, {}
+    for _, g in ipairs(dr.view or {}) do back[#back + 1] = g; seen[g] = true end
+    -- without the snapshot (a pile dealt by an older pad) only the dealt
+    -- guids go back: the hand may hold the drafter's earlier picks
+    if dr.before then
+      for g in pairs(inHandSet(color)) do
+        if not dr.before[g] and not seen[g] then back[#back + 1] = g; seen[g] = true end
+      end
+    end
+    guidsToSpot(back, s.piles[dr.pile], wYaw())
+    dr.view, dr.before = nil, nil
+  end
+  wTopTo(s.piles[dr.pile])
+  if nxt then
+    dr.pile = nxt
+    Wait.time(function() wLook(color == state.seat) end, 0.6)
+    buildControls()
+    return { pile = nxt }
+  end
+  local c = wTopTo(color == state.seat and poolSpot() or s.stack)
+  local blind = nil
+  if c and color == state.seat then
+    blind = { guid = c.getGUID(), nick = c.getName(), desc = c.getDescription() }
+  elseif c then
+    local hp, hr = handSpot(color)
+    c.setRotation({ 0, hr.y + 180, 0 }); c.setPosition({ hp.x, hp.y + 0.5, hp.z })
+  end
+  draftSay((color == state.seat and NAME or color) .. ' passed the last pile and took the top card of the stack.')
+  if color ~= state.seat then emit({ ev = 'draft', what = 'took', color = color, blind = true, n = c and 1 or 0 }) end
+  Wait.time(function() wTurn(wOther(color)) end, 1)
+  buildControls()
+  return { blind = blind }
+end
+
+function winstonChoice(color, take)
+  local dr = state.draft
+  if dr == nil or dr.format ~= 'winston' or dr.phase ~= 'picking' or color == state.seat then return end
+  if dr.turn ~= color then tellColor(color, 'It is ' .. tostring(dr.turn) .. "'s pick.", { 1, 0.6, 0.4 }) return end
+  if dr.view == nil then return end
+  pcall(removeWinstonPad)
+  local ok, err = pcall(function() if take then wTake(color) else wPass(color) end end)
+  if not ok then tellColor(color, (tostring(err):gsub('^.-:%d+: ', '')), { 1, 0.6, 0.4 }) end -- pattern-ok: short error text
+end
+function onWinstonTake(_, color) winstonChoice(color, true) end
+function onWinstonPass(_, color) winstonChoice(color, false) end
+
+function draftChat(color, text)
+  local dr = state.draft
+  if dr == nil or dr.format ~= 'winston' or dr.turn ~= color or type(text) ~= 'string' then return end
+  local w = firstWord(text)
+  if w == 'take' then winstonChoice(color, true) elseif w == 'pass' then winstonChoice(color, false) end
+end
+
+function winstonHumanTurn()
+  local dr = state.draft
+  if dr ~= nil and dr.format == 'winston' and dr.phase == 'picking' and dr.turn ~= state.seat and dr.view ~= nil then
+    return dr.turn, dr.pile
+  end
+  return nil
+end
+
+-- the AI's ops ---------------------------------------------------------------
+
+-- {format=auto|booster|pick_two|winston, seats=[colours]?, url=importer,
+--  set=code (the importer's own boosters, 3 per drafter) |
+--  cube=[names], packs=3, size=15}
+function ops.draft_start(req)
+  local seat, d0 = myData()
+  if state.draft and state.draft.phase ~= 'done' then error('a draft is already on (cancel_draft first)') end
+  math.randomseed(os.time())
+  local want = {}
+  if type(req.seats) == 'table' then for _, c in ipairs(req.seats) do want[tostring(c)] = true end end
+  local named = next(want) ~= nil
+  local seats = {}
+  for _, c in ipairs(COLORS) do
+    if c == seat or (named and want[c]) or (not named and Player[c].seated) then
+      local d = seatData(c)
+      if d == nil or d.playmat == nil then error('seat ' .. c .. ' has no mat on this table') end
+      seats[#seats + 1] = c
+    end
+  end
+  if #seats < 2 then error('a draft needs at least one human drafter seated (or named in seats)') end
+  local format = req.format
+  if format == nil or format == '' or format == 'auto' then
+    format = (#seats == 2 and 'winston') or (#seats <= 4 and 'pick_two') or 'booster'
+  end
+  if FORMATS[format] == nil then error('format must be auto, booster, pick_two or winston') end
+  if format == 'winston' and #seats ~= 2 then error('Winston is for exactly two drafters') end
+  local set = (type(req.set) == 'string' and req.set ~= '') and req.set:lower() or nil
+  local rounds = math.max(1, math.min(6, tonumber(req.packs) or 3))
+  local size = math.max(5, math.min(20, tonumber(req.size) or 15))
+  if set then rounds, size = 3, 13 end -- the importer's play boosters, basics out
+  local url = (type(req.url) == 'string' and req.url ~= '') and req.url or IMPORTER
+  -- a cube's packs are checked before anything moves
+  local first = nil
+  if not set then
+    first = makePacks(req, (format == 'winston' and 2 or #seats) * rounds, size)
+    if #first[1] == 0 then error('no cards to make packs from') end
+  end
+  local dr = { format = format, picks = format == 'pick_two' and 2 or 1, seats = seats, rounds = rounds, size = size,
+    phase = 'building', round = 0, pick = 0, hands = {}, waiting = {} }
+  state.draft = dr
+  local function failed(issues)
+    if state.draft ~= dr then return end
+    state.draft = nil
+    setStatus('Draft: the packs could not be built')
+    emit({ ev = 'draft', what = 'error', error = table.concat(issues or {}, '; ') })
+  end
+  if format == 'winston' then
+    local spots = winstonSpots(seats[1], seats[2])
+    local yaw = yawOf(d0.playmat)
+    -- every pack goes onto the one stack, shuffled
+    -- the standard Winston stack: 90 cards (six 15-card boosters' worth).
+    -- Boosters spawned on one spot merge as they land, so the no-pick cards
+    -- come out of whatever deck is there once it has been grouped.
+    local function stacked(issues, cap)
+      local objs = cardsAt(spots.stack, 2)
+      if #objs > 1 then pcall(function() group(objs) end) end
+      Wait.time(function()
+        if cap then stripTokens(cardsAt(spots.stack, 2)) end
+        for _, o in ipairs(cardsAt(spots.stack)) do
+          if o.type == 'Deck' then
+            o.shuffle()
+            local extra = cap and (o.getQuantity() - cap) or 0
+            local p = o.getPosition()
+            for _ = 1, extra do
+              local c = o.takeObject({ position = { p.x, p.y + 3, p.z }, smooth = false })
+              if c then destroyObject(c) end
+            end
+          end
+        end
+        Wait.time(function() if state.draft == dr then winstonBegin(issues) end end, 0.8)
+      end, 1.5)
+    end
+    if set then
+      importBoosters(url, set, seats, function() return spots.stack end, function() return yaw end, function(spawned, issues)
+        if state.draft ~= dr then return end
+        if spawned == nil or #spawned == 0 then return failed(issues) end
+        Wait.time(function() if state.draft == dr then stacked(issues, 90) end end, 0.5)
+      end, 1) -- nine boosters: about 117 cards without basics, cut to 90
+    else
+      local names = {}
+      for _, p in ipairs(first) do for _, n in ipairs(p) do names[#names + 1] = n end end
+      importNames(url, names, spots.stack, yaw, function(spawned, issues)
+        if state.draft ~= dr then return end
+        if spawned == nil or #spawned == 0 then return failed(issues) end
+        -- only the named cards: the importer's extra token cards go
+        splitPacks(spawned, { names }, { spots.stack }, yaw)
+        stacked(issues)
+      end)
+    end
+    setStatus('Draft: building packs...')
+    return { format = format, seats = seats, packs = set and 9 or 2 * rounds, size = size, picks = dr.picks, stack = set and 90 or 2 * rounds * size }
+  end
+  local function ready(issues, short)
+    Wait.time(function()
+      if state.draft ~= dr then return end
+      dr.phase = 'picking'
+      local probs = table.concat(issues, '; ')
+      if short > 0 then probs = (probs ~= '' and probs .. '; ' or '') .. short .. ' cards could not be built' end
+      emit({ ev = 'draft', what = 'ready', format = format, seats = table.concat(seats, ', '), packs = rounds, size = dr.size, problems = probs })
+      draftSay(FORMATS[format] .. ': ' .. rounds .. ' packs of ' .. dr.size .. ' for ' .. table.concat(seats, ', ') ..
+        '. Your pack lands in your hand: take ' .. dr.picks .. ' card' .. (dr.picks > 1 and 's' or '') ..
+        ' out, face-down onto your mat. Packs move on once everyone has picked.')
+      openRound(1)
+    end, 2.5)
+  end
+  if set then
+    importBoosters(url, set, seats,
+      function(n, r) return packSpot(seats[n] or seats[1], r, rounds) end,
+      function(n) return yawOf(seatData(seats[n] or seats[1]).playmat) end,
+      function(spawned, issues)
+        if state.draft ~= dr then return end
+        if spawned == nil or #spawned == 0 then return failed(issues) end
+        Wait.time(function()
+          if state.draft ~= dr then return end
+          for _, c in ipairs(seats) do for r = 1, rounds do stripTokens(cardsAt(packSpot(c, r, rounds))) end end
+          local n = countAt(packSpot(seats[1], 1, rounds))
+          if n > 0 then dr.size = n end
+          for _, c in ipairs(seats) do for r = 1, rounds do tidy(packSpot(c, r, rounds)) end end
+          ready(issues or {}, 0)
+        end, 0.5)
+      end)
+  else
+    local pending, built = #seats, 0
+    local allIssues, short = {}, 0
+    for si, c in ipairs(seats) do
+      local packs, names, spots = {}, {}, {}
+      for r = 1, rounds do
+        packs[r] = first[(si - 1) * rounds + r]
+        spots[r] = packSpot(c, r, rounds)
+        for _, n in ipairs(packs[r]) do names[#names + 1] = n end
+      end
+      local yaw = yawOf(seatData(c).playmat)
+      importNames(url, names, spots[1], yaw, function(spawned, issues)
+        if state.draft ~= dr then return end
+        for _, i in ipairs(issues or {}) do allIssues[#allIssues + 1] = i end
+        if spawned and #spawned > 0 then
+          built = built + 1
+          short = short + splitPacks(spawned, packs, spots, yaw)
+          for _, s in ipairs(spots) do tidy(s) end
+        end
+        pending = pending - 1
+        if pending > 0 then return end
+        if built < #seats then return failed(allIssues) end
+        ready(allIssues, short)
+      end)
+    end
+  end
+  setStatus('Draft: building packs...')
+  return { format = format, seats = seats, packs = rounds, size = size, picks = dr.picks }
+end
+
+-- {guids=[...]} (booster, pick-two) or {take=bool} (Winston)
+function ops.draft_pick(req)
+  local seat = requireSeat()
+  local dr = state.draft
+  if dr == nil or dr.phase ~= 'picking' then error('no draft is picking right now') end
+  if dr.format == 'winston' then
+    if dr.turn ~= seat then error('it is ' .. tostring(dr.turn) .. "'s pick, not yours") end
+    if req.take == true then return { took = wTake(seat) } end
+    local r = wPass(seat)
+    if r.pile then
+      local sizes, stack = wSizes()
+      return { passed = true, pile = r.pile, sizes = table.concat(sizes, '/'), stack = stack, cards = listAt(wSpots().piles[r.pile]) }
+    end
+    return { passed = true, blind = r.blind }
+  end
+  local h = dr.hands[seat]
+  if h == nil or h.need == 0 then error('no pack in your hand yet; it comes as a [draft] event') end
+  local inHand = inHandSet(seat)
+  local inPack, left = {}, 0
+  for _, g in ipairs(h.guids) do inPack[g] = true; if inHand[g] then left = left + 1 end end
+  local guids = req.guids or {}
+  local need = h.need - (#h.guids - left)
+  if need <= 0 then error('you already picked from this pack; the next one comes as a [draft] event') end
+  if #guids ~= need then error('take exactly ' .. need .. ' card(s) from this pack') end
+  local names = {}
+  for _, g in ipairs(guids) do
+    if not inPack[g] or not inHand[g] then error('not a card of your current pack: ' .. tostring(g)) end
+    names[#names + 1] = displayName(getObjectFromGUID(g).getName())
+  end
+  local before = countAt(poolSpot())
+  toPool(guids)
+  local waiting = {}
+  for _, c in ipairs(dr.waiting or {}) do if c ~= seat then waiting[#waiting + 1] = c end end
+  return { picked = names, pool = before + #guids, waitingOn = waiting, round = dr.round, pick = dr.pick }
+end
+
+function ops.draft_view(req)
+  local seat = requireSeat()
+  local dr = state.draft
+  if dr == nil then return { draft = false } end
+  local out = { draft = true, format = dr.format, phase = dr.phase, round = dr.round, rounds = dr.rounds, pick = dr.pick,
+    picks = dr.picks, seats = dr.seats, waitingOn = dr.waiting or {}, pool = listAt(poolSpot()) }
+  local h = dr.hands[seat]
+  if dr.format ~= 'winston' and h and h.need > 0 then
+    local inHand = inHandSet(seat)
+    local cards = {}
+    for _, g in ipairs(h.guids) do
+      local o = getObjectFromGUID(g)
+      if o and inHand[g] then cards[#cards + 1] = { guid = g, nick = o.getName(), desc = o.getDescription() } end
+    end
+    out.pack, out.need = cards, h.need - (#h.guids - #cards)
+  end
+  if dr.format == 'winston' and dr.phase == 'picking' then
+    local sizes, stack = wSizes()
+    out.turn, out.pile, out.sizes, out.stack = dr.turn, dr.pile, table.concat(sizes, '/'), stack
+    if dr.turn == seat then out.cards = listAt(wSpots().piles[dr.pile]) end
+  end
+  return out
+end
+
+-- {main=[pool guids], basics={Forest=8,...}, url=importer}: the chosen
+-- cards and the basics become the AI's library (shuffled), the rest of the
+-- pool its sideboard beside it; life goes to 20
+function ops.draft_build(req)
+  local seat, d = myData()
+  local dr = state.draft
+  if dr ~= nil and dr.phase ~= 'done' then error('the draft is still on: build once it is over') end
+  local pool = poolSpot()
+  if countAt(pool) == 0 then error('no pool on your mat to build from') end
+  local want = {}
+  for _, g in ipairs(req.main or {}) do want[g] = true end
+  local lp = d.libraryZone.getPosition()
+  local r = d.playmat.getTransformRight()
+  local side = { x = lp.x + r.x * 4, y = lp.y, z = lp.z + r.z * 4 }
+  if #cardsAt(lp) > 0 then error('your library spot is not empty: reset_board first') end
+  local yaw = yawOf(d.playmat)
+  local mainN, sideN = 0, 0
+  eachCardAt(pool, {
+    pos = function(i) return { side.x, side.y + 1 + i * 0.05, side.z } end,
+    rot = faceDownYaw(yaw),
+    done = function(c)
+      state.touched[c.getGUID()] = Time.time
+      if want[c.getGUID()] then
+        mainN = mainN + 1
+        c.setPosition({ lp.x, lp.y + 1 + mainN * 0.05, lp.z })
+      else
+        sideN = sideN + 1
+      end
+    end,
+  })
+  local names, nb = {}, 0
+  for n, k in pairs(req.basics or {}) do
+    for _ = 1, math.max(0, math.min(40, tonumber(k) or 0)) do names[#names + 1] = n; nb = nb + 1 end
+  end
+  local function finish(issues)
+    Wait.time(function()
+      for _, spot in ipairs({ lp, side }) do
+        local objs = cardsAt(spot)
+        if #objs > 1 then pcall(function() group(objs) end) end
+      end
+      Wait.time(function()
+        local lib = libraryTop(d)
+        if lib and lib.type == 'Deck' then lib.shuffle() end
+        state.looked = {}
+        emit({ ev = 'draft', what = 'built', main = mainN, basics = nb, sideboard = sideN, library = countAt(lp),
+          problems = table.concat(issues or {}, '; ') })
+      end, 1.5)
+    end, 1)
+  end
+  if #names > 0 then
+    importNames((type(req.url) == 'string' and req.url ~= '') and req.url or IMPORTER, names, lp, yaw,
+      function(_, issues) finish(issues) end)
+  else
+    finish({})
+  end
+  if d.lifeTracker then setLife(d.lifeTracker, 20) end
+  state.gameTurns = 0
+  return { main = mainN, sideboard = sideN, basics = nb, missing = #(req.main or {}) - mainN }
+end
+
+-- the draft is over for the pad: zone and play reports come back
+function endDraft()
+  if state.draft == nil then return end
+  pcall(removeWinstonPad)
+  state.draft = nil
+  pcall(seedField)
+  buildControls()
+end
+
+function ops.draft_cancel(req)
+  requireSeat()
+  if state.draft == nil then return { cancelled = false } end
+  endDraft()
+  draftSay('The draft was called off; its cards stay where they are.')
+  setStatus('Draft cancelled')
+  return { cancelled = true }
 end

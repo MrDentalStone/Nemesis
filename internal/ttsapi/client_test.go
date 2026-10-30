@@ -135,6 +135,26 @@ func TestCustomMessagesBecomeEvents(t *testing.T) {
 	}
 }
 
+func TestEventHookSeesLiveEventsFirst(t *testing.T) {
+	c, f := setup(t, func(m Message) []Message { return nil })
+	seen := make(chan string, 1)
+	c.OnEvent(func(raw json.RawMessage) { seen <- string(raw) })
+	f.push(Message{MessageID: 4, CustomMessage: json.RawMessage(`{"ev":"play","guid":"abc123"}`)})
+	select {
+	case got := <-seen:
+		if !strings.Contains(got, "abc123") {
+			t.Fatalf("hook saw %s", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("hook not called")
+	}
+	select {
+	case <-c.Events: // still queued for wait_for_event
+	case <-time.After(2 * time.Second):
+		t.Fatal("event not queued after the hook")
+	}
+}
+
 func TestReloadCallback(t *testing.T) {
 	c, f := setup(t, func(m Message) []Message { return nil })
 	done := make(chan struct{})
@@ -156,5 +176,48 @@ func TestUnreachableTTS(t *testing.T) {
 	_, err = c.Exec(context.Background(), "return 1")
 	if err == nil || !strings.Contains(err.Error(), "not reachable") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestForeignScriptErrorDoesNotFailCall(t *testing.T) {
+	c, _ := setup(t, func(m Message) []Message {
+		return []Message{
+			// a table helper reacting to the turn change we made
+			{MessageID: 3, GUID: "93894a", ErrorMessagePrefix: "darbs MTG Helpers - 93894a:", Error: "attempt to index a nil value\n at onPlayerTurn"},
+			{MessageID: 5, ReturnID: m.ReturnID, ReturnValue: json.RawMessage(`"ok"`)},
+		}
+	})
+	raw, err := c.Exec(context.Background(), "Turns.turn_color = 'Blue' return 'ok'")
+	if err != nil || string(raw) != `"ok"` {
+		t.Fatalf("raw=%s err=%v", raw, err)
+	}
+}
+
+func TestStaleEpochEventsAreDropped(t *testing.T) {
+	dir := t.TempDir()
+	old := cursorFile
+	cursorFile = func() string { return dir + "/cursor.json" }
+	t.Cleanup(func() { cursorFile = old })
+	c, f := setup(t, func(m Message) []Message { return nil })
+	c.SetCursor(200, 10)
+	// an older load's leftover timer: dropped, and the cursor stays put
+	f.push(Message{MessageID: 4, CustomMessage: json.RawMessage(`{"ev":"attack","epoch":100,"seq":55}`)})
+	f.push(Message{MessageID: 4, CustomMessage: json.RawMessage(`{"ev":"chat","epoch":200,"seq":11}`)})
+	select {
+	case ev := <-c.Events:
+		if !strings.Contains(string(ev), `"chat"`) {
+			t.Fatalf("stale event delivered: %s", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("live event lost")
+	}
+	if cur := c.LoadCursor(); cur != (Cursor{Epoch: 200, Seq: 11}) {
+		t.Fatalf("cursor = %+v", cur)
+	}
+	// a newer load wins
+	f.push(Message{MessageID: 4, CustomMessage: json.RawMessage(`{"ev":"pad","epoch":300,"seq":1}`)})
+	<-c.Events
+	if cur := c.LoadCursor(); cur != (Cursor{Epoch: 300, Seq: 1}) {
+		t.Fatalf("cursor after reload = %+v", cur)
 	}
 }

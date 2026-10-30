@@ -243,19 +243,19 @@ type Snapshot struct {
 		ClaudeTurn bool   `json:"claudeTurn"`
 	} `json:"turns"`
 	Pad struct {
-		Seat       string          `json:"seat"`
-		Stopped    bool            `json:"stopped"`
-		Pending    json.RawMessage `json:"pending"`
-		Version    string          `json:"version"`
-		Mode       string          `json:"mode"`
-		ModeName   string          `json:"modeName"`
-		NewPlayers []string        `json:"newPlayers"`
-		Round      *Round          `json:"round"`
-		PlayerPads int             `json:"playerPads"`
+		Seat         string          `json:"seat"`
+		Stopped      bool            `json:"stopped"`
+		Pending      json.RawMessage `json:"pending"`
+		Version      string          `json:"version"`
+		Mode         string          `json:"mode"`
+		ModeName     string          `json:"modeName"`
+		NewPlayers   []string        `json:"newPlayers"`
+		Round        *Round          `json:"round"`
+		DecisionPads bool            `json:"decisionPads"`
 	} `json:"pad"`
 }
 
-// Round is an open question on the player pads (ops.ask).
+// Round is an open question to the table (ops.ask).
 type Round struct {
 	ID        int             `json:"id"`
 	Kind      string          `json:"kind"`
@@ -292,12 +292,16 @@ func (p *Pad) Drain(ctx context.Context) (int, error) {
 			continue
 		}
 		p.tts.Inject(ev)
-		p.tts.Advance(epoch, seq)
 		n++
 	}
-	if n == 0 {
-		p.tts.Advance(epoch, int64(out.Seq))
+	// The live pad is the authority: set the cursor to its epoch even if a
+	// stale emitter (an older load's timer) had pushed it elsewhere, keeping
+	// any live event that arrived during the drain.
+	last := int64(out.Seq)
+	if now := p.tts.LoadCursor(); now.Epoch == epoch && now.Seq > last {
+		last = now.Seq
 	}
+	p.tts.SetCursor(epoch, last)
 	return n, nil
 }
 
@@ -312,6 +316,24 @@ func (p *Pad) Snapshot(ctx context.Context) (*Snapshot, error) {
 type HandReply struct {
 	Seat  string    `json:"seat"`
 	Cards []RawCard `json:"cards"`
+}
+
+// WindowReply is your own battlefield (no on-card state) and hand: what a
+// response window needs, in one light call.
+type WindowReply struct {
+	Seat        string      `json:"seat"`
+	Battlefield []Permanent `json:"battlefield"`
+	Cards       []RawCard   `json:"cards"`
+}
+
+// Window reads your battlefield and hand in one call. A pad older than
+// v1.2.0 has no window op: the caller falls back to Snapshot and Hand.
+func (p *Pad) Window(ctx context.Context) (*WindowReply, error) {
+	var w WindowReply
+	if err := p.Call(ctx, "window", nil, &w); err != nil {
+		return nil, err
+	}
+	return &w, nil
 }
 
 func (p *Pad) Hand(ctx context.Context) (*HandReply, error) {

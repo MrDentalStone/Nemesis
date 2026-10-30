@@ -144,6 +144,8 @@ yes lets you touch their tracker, and only for agreed numbers.
   priority, including opponents' turns and in response.
 - A counterspell targets a spell on the stack. Once a spell has resolved it
   is too late. "Any responses?" before resolving is how you give that window.
+  At this table a human's spell lands on their mat at once; while the pad holds
+  the table for you ("Hold on"), it still counts as on the stack.
 - Triggered abilities ("when", "whenever", "at") use the stack; announce them.
   Static abilities ("creatures you control get +1/+1") do not.
 - Hexproof: can't be the target of opponents' spells or abilities. Shroud:

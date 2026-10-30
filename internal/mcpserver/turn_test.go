@@ -87,3 +87,35 @@ func TestSeatOut(t *testing.T) {
 		t.Errorf("an out seat's Orb is gone: %v", got)
 	}
 }
+
+func TestTokenQuery(t *testing.T) {
+	for in, want := range map[string]string{
+		"Treasure":               `!"Treasure" -is:dfc`,
+		" Food ":                 `!"Food" -is:dfc`,
+		"Elf Warrior":            `!"Elf Warrior" -is:dfc`,
+		"!Treasure -is:dfc":      "!Treasure -is:dfc",
+		"!Beast pow=3 tou=3 c:g": "!Beast pow=3 tou=3 c:g",
+		`"Spirit" c:w`:           `"Spirit" c:w`,
+		"Clue -is:dfc":           "Clue -is:dfc",
+	} {
+		if got := tokenQuery(in); got != want {
+			t.Errorf("tokenQuery(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestCommanderTax(t *testing.T) {
+	resetCommanderTax()
+	if _, tax := commanderTax("abc", "hand"); tax != 0 {
+		t.Fatalf("a cast from hand has no tax, got %d", tax)
+	}
+	for i, want := range []int{0, 2, 4} {
+		if nth, tax := commanderTax("abc", "command"); nth != i+1 || tax != want {
+			t.Fatalf("cast %d: nth=%d tax=%d, want tax %d", i+1, nth, tax, want)
+		}
+	}
+	resetCommanderTax()
+	if _, tax := commanderTax("abc", "command"); tax != 0 {
+		t.Fatalf("a new deck starts untaxed, got %d", tax)
+	}
+}

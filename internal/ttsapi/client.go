@@ -80,6 +80,7 @@ type Client struct {
 
 	reloadMu sync.Mutex
 	onReload []func()
+	onEvent  []func(json.RawMessage)
 
 	speaker atomic.Pointer[string] // the AI's chat prefix, e.g. "[Kestrel]"
 
@@ -92,7 +93,7 @@ type Client struct {
 func Listen(ttsAddr, listenAddr string) (*Client, error) {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		return nil, fmt.Errorf("bind %s: %w (is the Atom/VS Code TTS plugin running? only one editor can listen)", listenAddr, err)
+		return nil, fmt.Errorf("bind %s: %w (%s)", listenAddr, err, bindHint(listenAddr))
 	}
 	c := &Client{
 		ttsAddr: ttsAddr,
@@ -132,6 +133,16 @@ func (c *Client) SetSpeaker(name string) {
 func (c *Client) OnReload(fn func()) {
 	c.reloadMu.Lock()
 	c.onReload = append(c.onReload, fn)
+	c.reloadMu.Unlock()
+}
+
+// OnEvent registers a callback for every live pad event, run as it arrives
+// and before it is queued on Events, so the server can act at once (hold the
+// table for a response) while the model is still busy. Events drained from
+// the pad's buffer are old news and do not reach it. fn must not block.
+func (c *Client) OnEvent(fn func(json.RawMessage)) {
+	c.reloadMu.Lock()
+	c.onEvent = append(c.onEvent, fn)
 	c.reloadMu.Unlock()
 }
 
@@ -176,6 +187,12 @@ func (c *Client) handle(conn net.Conn) {
 		if c.seenBefore(m.CustomMessage) {
 			break // already delivered through a drain
 		}
+		c.reloadMu.Lock()
+		hooks := append([]func(json.RawMessage){}, c.onEvent...)
+		c.reloadMu.Unlock()
+		for _, fn := range hooks {
+			fn(m.CustomMessage)
+		}
 		select {
 		case c.Events <- m.CustomMessage:
 		default:
@@ -187,6 +204,9 @@ func (c *Client) handle(conn net.Conn) {
 	case msgError:
 		c.addLog("error", m.GUID, strings.TrimSpace(m.ErrorMessagePrefix+m.Error))
 		c.forwardLog("error", strings.TrimSpace(m.ErrorMessagePrefix+m.Error))
+		if !ownError(m) {
+			break // another object's script failed (a table helper's onPlayerTurn): not our call
+		}
 		select {
 		case c.errCh <- m.Error:
 		default:
@@ -200,6 +220,15 @@ func (c *Client) handle(conn net.Conn) {
 			fn()
 		}
 	}
+}
+
+// ownError reports whether a Lua error can belong to a script we sent: those
+// run as Global (guid -1). The pad's ops are pcall-wrapped and come back as
+// JSON, so an error with an object's GUID is a table script reacting to what
+// we did (darbs MTG Helpers erroring in onPlayerTurn when end_turn moves the
+// marker), and it must not fail a call that worked.
+func ownError(m Message) bool {
+	return m.GUID == "" || m.GUID == "-1"
 }
 
 // forwardLog turns table output into an event so wait_for_event sees what the
@@ -229,6 +258,9 @@ type Cursor struct {
 	Seq   int64 `json:"seq"`
 }
 
+// cursorFile is where the cursor persists; tests point it at a temp dir.
+var cursorFile = cursorPath
+
 func cursorPath() string {
 	dir, err := os.UserCacheDir()
 	if err != nil {
@@ -245,7 +277,7 @@ func (c *Client) LoadCursor() Cursor {
 		return c.cursor
 	}
 	c.curLoaded = true
-	if b, err := os.ReadFile(cursorPath()); err == nil {
+	if b, err := os.ReadFile(cursorFile()); err == nil {
 		_ = json.Unmarshal(b, &c.cursor)
 	}
 	return c.cursor
@@ -261,8 +293,8 @@ func (c *Client) Advance(epoch, seq int64) {
 	}
 	c.cursor = Cursor{Epoch: epoch, Seq: seq}
 	b, _ := json.Marshal(c.cursor)
-	_ = os.MkdirAll(filepath.Dir(cursorPath()), 0o755)
-	_ = os.WriteFile(cursorPath(), b, 0o644)
+	_ = os.MkdirAll(filepath.Dir(cursorFile()), 0o755)
+	_ = os.WriteFile(cursorFile(), b, 0o644)
 }
 
 // seenBefore reports whether a pushed event is at or behind the cursor
@@ -280,8 +312,29 @@ func (c *Client) seenBefore(raw json.RawMessage) bool {
 	if epoch == cur.Epoch && seq <= cur.Seq {
 		return true
 	}
+	if epoch < cur.Epoch {
+		// an older load of the pad: a timer left running by a script that was
+		// replaced in place. Its events are duplicates, and following its
+		// epoch would make the next drain replay the live pad's whole ring.
+		return true
+	}
 	c.Advance(epoch, seq)
 	return false
+}
+
+// SetCursor sets the cursor to what the live pad reported, older epoch or
+// not: the pad a drain asked is the authority on where its ring stands.
+func (c *Client) SetCursor(epoch, seq int64) {
+	c.LoadCursor()
+	c.curMu.Lock()
+	defer c.curMu.Unlock()
+	if c.cursor == (Cursor{Epoch: epoch, Seq: seq}) {
+		return
+	}
+	c.cursor = Cursor{Epoch: epoch, Seq: seq}
+	b, _ := json.Marshal(c.cursor)
+	_ = os.MkdirAll(filepath.Dir(cursorFile()), 0o755)
+	_ = os.WriteFile(cursorFile(), b, 0o644)
 }
 
 // Inject delivers an event fetched from the pad's ring as if it had been pushed.

@@ -49,6 +49,10 @@ but not yet exercised in a game. Pad v0.6.0 adds:
   as cards in hand.
 - **Player counters.** The poison, energy and experience tiles beside each mat show up
   in `table_state` ("poison 3") whenever they are not zero.
+- **MTG Lotus Helper** (2026-10 update): mana and energy counters inside the land
+  box, and locked preview basics floating in front of each fetch land. The pad
+  keeps cards off the counters and ignores the previews (locked cards are never
+  reported as plays).
 - **Card preview.** The table's card sniffer is harmless to Nemesis; remove the
   sniffer figure if you do not want the preview.
 

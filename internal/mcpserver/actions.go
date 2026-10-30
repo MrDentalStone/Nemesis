@@ -3,8 +3,10 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -12,6 +14,7 @@ import (
 	"github.com/MrDentalStone/Nemesis/internal/cards"
 	"github.com/MrDentalStone/Nemesis/internal/content"
 	"github.com/MrDentalStone/Nemesis/internal/importer"
+	"github.com/MrDentalStone/Nemesis/internal/pad"
 )
 
 // registerActions adds the tools that move your own objects. Every one
@@ -40,7 +43,7 @@ func registerActions(s *mcp.Server, d Deps) {
 		N      int    `json:"n,omitempty" jsonschema:"cards to draw (default 1)"`
 		Reason string `json:"reason,omitempty" jsonschema:"the card or rule that makes you draw, e.g. 'Ponder' (needed after begin_turn, which already drew for the turn)"`
 	}
-	mcp.AddTool(s, &mcp.Tool{Name: "draw", Description: "Draw n cards for a card effect. Not for your turn's draw (begin_turn does it) or your opening hand (import_deck deals it). Returns the hand."},
+	mcp.AddTool(s, &mcp.Tool{Name: "draw", Description: "Draw n cards for a card effect. Not for your turn's draw (begin_turn does it) or your opening hand (import_deck deals it). Returns the new cards and the rest of your hand by name."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in drawIn) (*mcp.CallToolResult, any, error) {
 			n := in.N
 			if n <= 0 {
@@ -52,29 +55,39 @@ func registerActions(s *mcp.Server, d Deps) {
 			if drew && strings.TrimSpace(in.Reason) == "" {
 				return nil, nil, fmt.Errorf("not drawn: begin_turn already drew your card for this turn. Only if a card makes you draw, call draw again with reason set to that card")
 			}
-			r, err := call(ctx, "draw", map[string]any{"n": n})
+			before, err := d.Pad.Hand(ctx)
 			if err != nil {
+				return nil, nil, err
+			}
+			var out struct {
+				Drew        int `json:"drew"`
+				LibraryLeft int `json:"libraryLeft"`
+			}
+			if err := d.Pad.Call(ctx, "draw", map[string]any{"n": n}, &out); err != nil {
 				return nil, nil, err
 			}
 			if !drew {
 				setDrew(true) // the turn's draw, held back by begin_turn
 			}
-			// deal() animates; the hand zone only owns the cards once they land
-			select {
-			case <-time.After(1800 * time.Millisecond):
-			case <-ctx.Done():
-				return nil, nil, ctx.Err()
-			}
-			h, err := d.Pad.Hand(ctx)
+			h, err := dealt(ctx, d, len(before.Cards)+out.Drew)
 			if err != nil {
-				return text(r), nil, nil
+				return nil, nil, err
+			}
+			had := map[string]bool{}
+			for _, rc := range before.Cards {
+				had[rc.GUID] = true
 			}
 			var b strings.Builder
-			b.WriteString(r + "\n")
-			fmt.Fprintf(&b, "Hand of %s (%d cards)\n", h.Seat, len(h.Cards))
+			fmt.Fprintf(&b, "Drew %d (%d left in your library):\n", out.Drew, out.LibraryLeft)
+			var rest []string
 			for _, rc := range h.Cards {
-				b.WriteString(renderCard(rc.Parse(), rc.Zone))
+				if had[rc.GUID] {
+					rest = append(rest, rc.Parse().Name+" ["+rc.GUID+"]")
+				} else {
+					b.WriteString(renderCard(rc.Parse(), rc.Zone))
+				}
 			}
+			fmt.Fprintf(&b, "Rest of your hand (%d): %s\n", len(rest), strings.Join(rest, ", "))
 			return text(b.String()), nil, nil
 		})
 
@@ -99,13 +112,7 @@ func registerActions(s *mcp.Server, d Deps) {
 			}
 			_ = json.Unmarshal([]byte(r), &untapped)
 			fmt.Fprintf(&b, "Untapped everything (%d permanents were tapped).\n", len(untapped.Untapped))
-			// setRotationSmooth takes about a second; a snapshot read before it
-			// lands still shows the cards tapped
-			select {
-			case <-time.After(1200 * time.Millisecond):
-			case <-ctx.Done():
-				return nil, nil, ctx.Err()
-			}
+			untappedAt := time.Now()
 			var held []string
 			if !in.SkipDraw {
 				if snap, err := d.Pad.Snapshot(ctx); err == nil {
@@ -119,25 +126,26 @@ func registerActions(s *mcp.Server, d Deps) {
 					b.WriteString("  - " + h + "\n")
 				}
 				b.WriteString("Say and resolve them now (mills, life loss, a replaced draw), then take your turn's draw with draw() unless one of them replaces it.\n")
-			} else if !in.SkipDraw {
-				if _, err := call(ctx, "draw", map[string]any{"n": 1}); err != nil {
-					return nil, nil, err
-				}
-				// deal() animates; the hand zone only owns the card once it lands
-				select {
-				case <-time.After(1800 * time.Millisecond):
-				case <-ctx.Done():
-					return nil, nil, ctx.Err()
-				}
-				b.WriteString("Drew 1.\n")
 			}
 			h, err := d.Pad.Hand(ctx)
 			if err != nil {
 				return nil, nil, err
 			}
-			fmt.Fprintf(&b, "\nHand of %s (%d cards)\n", h.Seat, len(h.Cards))
-			for _, rc := range h.Cards {
-				b.WriteString(renderCard(rc.Parse(), rc.Zone))
+			if len(held) == 0 && !in.SkipDraw {
+				if _, err := call(ctx, "draw", map[string]any{"n": 1}); err != nil {
+					return nil, nil, err
+				}
+				if h, err = dealt(ctx, d, len(h.Cards)+1); err != nil {
+					return nil, nil, err
+				}
+				b.WriteString("Drew 1.\n")
+			}
+			b.WriteString("\n")
+			renderHand(&b, h)
+			// setRotationSmooth takes about a second; a snapshot read before it
+			// lands still shows the cards tapped
+			if err := sleepCtx(ctx, 1200*time.Millisecond-time.Since(untappedAt)); err != nil {
+				return nil, nil, err
 			}
 			snap, err := d.Pad.Snapshot(ctx)
 			if err != nil {
@@ -158,10 +166,14 @@ func registerActions(s *mcp.Server, d Deps) {
 
 	type playIn struct {
 		GUID string `json:"guid" jsonschema:"card guid from my_hand or table_state (command zone)"`
-		Row  string `json:"row,omitempty" jsonschema:"land | creature | other | stack (default other). Use stack for instants/sorceries and anything that should be announced before it resolves."`
+		Row  string `json:"row,omitempty" jsonschema:"land | creature | other | stack (default other)"`
+		Say  string `json:"say,omitempty" jsonschema:"one short chat line to say first (saves a say call)"`
 	}
-	mcp.AddTool(s, &mcp.Tool{Name: "play", Description: "Put a card from your hand or command zone onto your battlefield (land/creature/other row) or onto the stack spot. Say what you're doing first."},
+	mcp.AddTool(s, &mcp.Tool{Name: "play", Description: "Put a card from your hand or command zone onto your battlefield (land/creature/other row) or onto the stack spot. Spells go through cast; this is for lands and putting cards into play."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in playIn) (*mcp.CallToolResult, any, error) {
+			if err := announce(ctx, d, in.Say); err != nil {
+				return nil, nil, err
+			}
 			r, err := call(ctx, "play", map[string]any{"guid": in.GUID, "row": in.Row})
 			if err != nil {
 				return nil, nil, err
@@ -171,10 +183,19 @@ func registerActions(s *mcp.Server, d Deps) {
 
 	type guidsIn struct {
 		GUIDs []string `json:"guids" jsonschema:"guids of permanents on your battlefield"`
+		Say   string   `json:"say,omitempty" jsonschema:"one short chat line to say first (saves a say call)"`
 	}
-	mcp.AddTool(s, &mcp.Tool{Name: "tap", Description: "Tap permanents on your battlefield (mana, attackers, abilities)."},
-		func(ctx context.Context, _ *mcp.CallToolRequest, in guidsIn) (*mcp.CallToolResult, any, error) {
-			r, err := call(ctx, "tap", map[string]any{"guids": in.GUIDs})
+	type tapIn struct {
+		GUIDs []string `json:"guids" jsonschema:"guids of permanents on your battlefield"`
+		Mana  bool     `json:"mana,omitempty" jsonschema:"they pay for mana: a Treasure or other sacrifice-for-mana source is sacrificed instead of tapped (cast tap= does this for you)"`
+		Say   string   `json:"say,omitempty" jsonschema:"one short chat line to say first (saves a say call)"`
+	}
+	mcp.AddTool(s, &mcp.Tool{Name: "tap", Description: "Tap permanents on your battlefield (mana, attackers, abilities). mana=true sacrifices Treasures and the like."},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in tapIn) (*mcp.CallToolResult, any, error) {
+			if err := announce(ctx, d, in.Say); err != nil {
+				return nil, nil, err
+			}
+			r, err := call(ctx, "tap", map[string]any{"guids": in.GUIDs, "mana": in.Mana})
 			if err != nil {
 				return nil, nil, err
 			}
@@ -184,9 +205,13 @@ func registerActions(s *mcp.Server, d Deps) {
 	type untapIn struct {
 		GUIDs []string `json:"guids,omitempty" jsonschema:"specific permanents to untap"`
 		All   bool     `json:"all,omitempty" jsonschema:"untap everything on your battlefield (untap step)"`
+		Say   string   `json:"say,omitempty" jsonschema:"one short chat line to say first (saves a say call)"`
 	}
 	mcp.AddTool(s, &mcp.Tool{Name: "untap", Description: "Untap your permanents - specific guids, or all=true for the untap step."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in untapIn) (*mcp.CallToolResult, any, error) {
+			if err := announce(ctx, d, in.Say); err != nil {
+				return nil, nil, err
+			}
 			r, err := call(ctx, "untap", map[string]any{"guids": in.GUIDs, "all": in.All})
 			if err != nil {
 				return nil, nil, err
@@ -196,9 +221,13 @@ func registerActions(s *mcp.Server, d Deps) {
 
 	type guidIn struct {
 		GUID string `json:"guid"`
+		Say  string `json:"say,omitempty" jsonschema:"one short chat line to say first (saves a say call)"`
 	}
 	mcp.AddTool(s, &mcp.Tool{Name: "flip", Description: "Flip one of your cards (transform DFCs, morph face-up, etc.)."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in guidIn) (*mcp.CallToolResult, any, error) {
+			if err := announce(ctx, d, in.Say); err != nil {
+				return nil, nil, err
+			}
 			r, err := call(ctx, "flip", map[string]any{"guid": in.GUID})
 			if err != nil {
 				return nil, nil, err
@@ -207,17 +236,37 @@ func registerActions(s *mcp.Server, d Deps) {
 		})
 
 	type moveIn struct {
-		GUID string `json:"guid" jsonschema:"one of your objects (hand, battlefield, graveyard, exile, command zone, or a library card from look)"`
-		To   string `json:"to" jsonschema:"graveyard | exile | command | hand | stack | battlefield | library_top | library_bottom"`
-		Row  string `json:"row,omitempty" jsonschema:"when to=battlefield: land | creature | other"`
+		GUID  string   `json:"guid,omitempty" jsonschema:"one of your objects (hand, battlefield, graveyard, exile, command zone, or a library card from look)"`
+		GUIDs []string `json:"guids,omitempty" jsonschema:"or several, moved in this order (to library_top: the last one ends on top)"`
+		To    string   `json:"to" jsonschema:"graveyard | exile | command | hand | stack | battlefield | library_top | library_bottom"`
+		Row   string   `json:"row,omitempty" jsonschema:"when to=battlefield: land | creature | other"`
+		Say   string   `json:"say,omitempty" jsonschema:"one short chat line to say first (saves a say call)"`
 	}
 	mcp.AddTool(s, &mcp.Tool{Name: "move", Description: "Move one of your objects between zones: resolve a spell from the stack to the graveyard/battlefield, discard, exile, return to hand, put on top/bottom of library, commander back to the command zone."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in moveIn) (*mcp.CallToolResult, any, error) {
-			r, err := call(ctx, "move", map[string]any{"guid": in.GUID, "to": in.To, "row": in.Row})
-			if err != nil {
+			guids := in.GUIDs
+			if in.GUID != "" {
+				guids = append([]string{in.GUID}, guids...)
+			}
+			if len(guids) == 0 {
+				return nil, nil, errors.New("give guid or guids")
+			}
+			if err := announce(ctx, d, in.Say); err != nil {
 				return nil, nil, err
 			}
-			return text(r), nil, nil
+			var lines []string
+			for i, g := range guids {
+				r, err := call(ctx, "move", map[string]any{"guid": g, "to": in.To, "row": in.Row})
+				if err != nil {
+					if i == 0 {
+						return nil, nil, err
+					}
+					lines = append(lines, fmt.Sprintf("STOPPED at [%s]: %v (the ones before it moved)", g, err))
+					break
+				}
+				lines = append(lines, r)
+			}
+			return text(strings.Join(lines, "\n")), nil, nil
 		})
 
 	type searchIn struct {
@@ -227,6 +276,7 @@ func registerActions(s *mcp.Server, d Deps) {
 		Row       string `json:"row,omitempty" jsonschema:"battlefield row: land, creature, other (default other)"`
 		Tapped    bool   `json:"tapped,omitempty" jsonschema:"put onto the battlefield tapped"`
 		Desc      bool   `json:"desc,omitempty" jsonschema:"also match the oracle text"`
+		Basic     bool   `json:"basic,omitempty" jsonschema:"only basic lands: set it for 'search for a basic land' effects (Terramorphic Expanse, Cultivate, Rampant Growth), or 'forest' also matches Breeding Pool"`
 		NoShuffle bool   `json:"no_shuffle,omitempty" jsonschema:"skip the shuffle afterwards (almost never)"`
 	}
 	mcp.AddTool(s, &mcp.Tool{Name: "search_library", Description: "Search your OWN library for cards matching a query (tutors, ramp like Cultivate/Wood Elves/Skyshroud Claim) and put them onto the battlefield or into hand, then shuffle. Reports only the cards taken and the number of matches. Only when a card effect allows it; say which card."},
@@ -243,7 +293,7 @@ func registerActions(s *mcp.Server, d Deps) {
 				To       string `json:"to"`
 				Shuffled bool   `json:"shuffled"`
 			}
-			args := map[string]any{"query": in.Query, "n": n, "to": in.To, "row": in.Row, "tapped": in.Tapped, "desc": in.Desc, "noShuffle": in.NoShuffle}
+			args := map[string]any{"query": in.Query, "n": n, "to": in.To, "row": in.Row, "tapped": in.Tapped, "desc": in.Desc, "basic": in.Basic, "noShuffle": in.NoShuffle}
 			if err := d.Pad.Call(ctx, "search", args, &out); err != nil {
 				return nil, nil, err
 			}
@@ -262,7 +312,7 @@ func registerActions(s *mcp.Server, d Deps) {
 		Loyalty        int      `json:"loyalty,omitempty" jsonschema:"delta of loyalty on a planeswalker"`
 		Power          int      `json:"power,omitempty" jsonschema:"delta to power (non-counter effects you want shown)"`
 		Toughness      int      `json:"toughness,omitempty" jsonschema:"delta to toughness"`
-		Keywords       []string `json:"keywords,omitempty" jsonschema:"keyword icons to add: flying, first strike, double strike, deathtouch, lifelink, trample, vigilance, menace, reach, haste, hexproof, indestructible, defender, frozen, monstrous, stun, exert, renowned, suspend"`
+		Keywords       []string `json:"keywords,omitempty" jsonschema:"keyword icons to add (flying, trample, haste, hexproof, indestructible...; also frozen, monstrous, stun, exert)"`
 		RemoveKeywords bool     `json:"remove_keywords,omitempty" jsonschema:"remove the listed keywords instead of adding them"`
 		Note           *string  `json:"note,omitempty" jsonschema:"set the card's notepad text (empty string clears)"`
 		Phased         *bool    `json:"phased,omitempty" jsonschema:"true = phased out marker on, false = off"`
@@ -434,34 +484,27 @@ func registerActions(s *mcp.Server, d Deps) {
 		})
 
 	type tokenIn struct {
-		Query string `json:"query" jsonschema:"Scryfall SEARCH SYNTAX for the token (t:token is added for you). Use an EXACT name with ! plus -is:dfc so a double-faced or similarly named token is not picked: '!Treasure -is:dfc', '!Food -is:dfc', '!Beast pow=3 tou=3 c:g -is:dfc', '!Plant pow=0 tou=1 -is:dfc'. Plain words like 'Beast 3/3' do not work."`
-		N     int    `json:"n,omitempty" jsonschema:"how many copies (default 1)"`
-		Row   string `json:"row,omitempty" jsonschema:"creature | other (default creature)"`
+		Query     string `json:"query" jsonschema:"the token's exact name ('Treasure', 'Food', 'Clue') or Scryfall SEARCH SYNTAX (t:token is added for you) when several share a name: '!Beast pow=3 tou=3 c:g -is:dfc', '!Plant pow=0 tou=1 -is:dfc'. A plain name is searched as that exact name. Plain words like 'Beast 3/3' do not work."`
+		N         int    `json:"n,omitempty" jsonschema:"how many separate cards (default 1): only for tokens that differ"`
+		Count     int    `json:"count,omitempty" jsonschema:"the usual way: ONE card that stands for this many tokens, with the count on its counter and in its note"`
+		Row       string `json:"row,omitempty" jsonschema:"creature | other (default: creature for creature tokens, other for the rest)"`
+		Power     *int   `json:"power,omitempty" jsonschema:"the token's real power when the card found differs (Phelddagrif's Hippo is a 1/1, Scryfall's Hippo a 3/3): the card is marked to show it"`
+		Toughness *int   `json:"toughness,omitempty" jsonschema:"the token's real toughness, as for power"`
+		Note      string `json:"note,omitempty" jsonschema:"notepad text for the token, e.g. 'Hippo for Blue (Phelddagrif)' when it is a gift for another player"`
 	}
-	mcp.AddTool(s, &mcp.Tool{Name: "spawn_token", Description: "Create token cards on your battlefield: found on Scryfall, built by the deck importer."},
+	mcp.AddTool(s, &mcp.Tool{Name: "spawn_token", Description: "Create tokens on your battlefield (found on Scryfall, built by the deck importer). For several alike, pass count: one card plus a counter. power/toughness fix a token whose Scryfall card has other stats; note labels it. A token for another player lands on your mat: ask them to drag it over."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in tokenIn) (*mcp.CallToolResult, any, error) {
-			found, err := d.Scryfall.Search(ctx, "t:token "+in.Query, "")
+			card, nick, err := tokenCard(ctx, d, in.Query)
 			if err != nil {
 				return nil, nil, err
 			}
-			if len(found) == 0 {
-				return nil, nil, fmt.Errorf("no token matched %q on Scryfall", in.Query)
-			}
-			tok := found[0]
-			line := fmt.Sprintf("1 %s (%s) %s", tok.Name, strings.ToUpper(tok.Set), tok.CollectorNumber)
-			piles, issues, err := d.Importer.Build(ctx, line)
-			if err != nil {
-				return nil, nil, err
-			}
-			if len(piles) == 0 {
-				return nil, nil, fmt.Errorf("the importer could not build %q (%s)", line, strings.Join(issues, "; "))
-			}
-			card, nick, err := importer.FirstCard(piles[0])
-			if err != nil {
-				return nil, nil, err
+			parsed := cards.Parse(nick, "")
+			name := parsed.Name
+			if in.Row == "" && !strings.Contains(parsed.TypeLine, "Creature") {
+				in.Row = "other"
 			}
 			n := in.N
-			if n <= 0 {
+			if n <= 0 || in.Count > 1 {
 				n = 1
 			}
 			var guids []string
@@ -474,7 +517,56 @@ func registerActions(s *mcp.Server, d Deps) {
 				}
 				guids = append(guids, out.GUID)
 			}
-			return text(fmt.Sprintf("spawned %d x %s: %s", n, cards.Parse(nick, "").Name, strings.Join(guids, ", "))), nil, nil
+			note := in.Note
+			if in.Count > 1 && note == "" {
+				note = fmt.Sprintf("%d %s tokens", in.Count, name)
+			}
+			if in.Count <= 1 && note == "" && in.Power == nil && in.Toughness == nil {
+				return text(fmt.Sprintf("spawned %d x %s (%s): %s", n, name, parsed.TypeLine, strings.Join(guids, ", "))), nil, nil
+			}
+			var fixed []string
+			for _, g := range guids {
+				args := map[string]any{"guid": g, "token": true}
+				if note != "" {
+					args["note"] = note
+				}
+				if in.Count > 1 {
+					args["counters"] = in.Count
+				}
+				var got struct {
+					Now struct {
+						BasePower     *float64 `json:"basePower"`
+						BaseToughness *float64 `json:"baseToughness"`
+					} `json:"now"`
+				}
+				if err := markLanded(ctx, d, args, &got); err != nil {
+					return text(fmt.Sprintf("spawned %s [%s], but could not mark it (%v): mark it yourself", name, g, err)), nil, nil
+				}
+				pt := map[string]any{"guid": g}
+				if in.Power != nil && got.Now.BasePower != nil && *in.Power != int(*got.Now.BasePower) {
+					pt["power"] = *in.Power - int(*got.Now.BasePower)
+				}
+				if in.Toughness != nil && got.Now.BaseToughness != nil && *in.Toughness != int(*got.Now.BaseToughness) {
+					pt["toughness"] = *in.Toughness - int(*got.Now.BaseToughness)
+				}
+				if len(pt) > 1 {
+					if err := d.Pad.Call(ctx, "mark", pt, nil); err != nil {
+						return text(fmt.Sprintf("spawned %s [%s], but could not set its P/T (%v): mark(power=, toughness=) yourself", name, g, err)), nil, nil
+					}
+				}
+				fixed = append(fixed, g)
+			}
+			msg := fmt.Sprintf("spawned %d x %s: %s", n, name, strings.Join(fixed, ", "))
+			if in.Count > 1 {
+				msg = fmt.Sprintf("spawned %s [%s] with %d counters", name, fixed[0], in.Count)
+			}
+			if in.Power != nil || in.Toughness != nil {
+				msg += " (P/T marked to the token's real stats)"
+			}
+			if note != "" {
+				msg += ": " + note
+			}
+			return text(msg), nil, nil
 		})
 
 	type importIn struct {
@@ -483,6 +575,7 @@ func registerActions(s *mcp.Server, d Deps) {
 	}
 	mcp.AddTool(s, &mcp.Tool{Name: "import_deck", Description: "Build a deck with the table's deck importer, place it in your library and command zone, and deal your opening 7 (waits ~5-20 s for the piles). Then decide keep or mulligan; deck_info has the pilot notes."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in importIn) (*mcp.CallToolResult, any, error) {
+			resetCommanderTax()
 			data, note := in.Data, ""
 			if in.Deck != "" {
 				dk := d.Content.Decks[in.Deck]
@@ -509,26 +602,16 @@ func registerActions(s *mcp.Server, d Deps) {
 				return nil, nil, fmt.Errorf("import failed: %s", hit.Str("error"))
 			}
 			// the piles settle for a moment before the library deals cleanly
-			select {
-			case <-time.After(2 * time.Second):
-			case <-ctx.Done():
-				return nil, nil, ctx.Err()
+			if err := sleepCtx(ctx, 2*time.Second); err != nil {
+				return nil, nil, err
 			}
 			if _, err := call(ctx, "draw", map[string]any{"n": 7}); err != nil {
 				return text(Render(hit) + note + "\nCould not deal the opening hand: " + err.Error()), nil, nil
 			}
-			select {
-			case <-time.After(2500 * time.Millisecond):
-			case <-ctx.Done():
-				return nil, nil, ctx.Err()
-			}
 			var b strings.Builder
 			b.WriteString(Render(hit) + note + "\nDealt your opening 7 (do not draw again). Keep or mulligan, and say which.\n")
-			if h, err := d.Pad.Hand(ctx); err == nil {
-				fmt.Fprintf(&b, "Hand (%d cards)\n", len(h.Cards))
-				for _, rc := range h.Cards {
-					b.WriteString(renderCard(rc.Parse(), rc.Zone))
-				}
+			if h, err := dealt(ctx, d, 7); err == nil {
+				renderHand(&b, h)
 			}
 			return text(b.String() + meanwhile(seen)), nil, nil
 		})
@@ -549,40 +632,55 @@ func registerActions(s *mcp.Server, d Deps) {
 		})
 
 	type castIn struct {
-		GUID   string   `json:"guid" jsonschema:"the spell: a card in your hand or command zone"`
-		Tap    []string `json:"tap,omitempty" jsonschema:"your mana sources to tap for it"`
-		Note   string   `json:"note,omitempty" jsonschema:"targets or modes, e.g. 'targeting White's Arahbo'"`
-		To     string   `json:"to,omitempty" jsonschema:"where it goes when it resolves: creature | other | graveyard (default: by type, instants and sorceries to the graveyard)"`
-		Window *int     `json:"window,omitempty" jsonschema:"leave out: the server holds Game Changers, mana value 4+, spells that affect other players and your commander for 8 s, and resolves the rest at once"`
+		GUID      string   `json:"guid" jsonschema:"the spell: a card in your hand or command zone"`
+		Tap       []string `json:"tap,omitempty" jsonschema:"your mana sources to tap for it; a Treasure (or another source that sacrifices itself for mana) is sacrificed, and a counted token card loses one"`
+		Note      string   `json:"note,omitempty" jsonschema:"targets or modes, e.g. 'targeting White's Arahbo'"`
+		To        string   `json:"to,omitempty" jsonschema:"where it goes when it resolves: creature | other | graveyard (default: by type, instants and sorceries to the graveyard)"`
+		Window    *int     `json:"window,omitempty" jsonschema:"leave out (the server picks: 30 s with decision pads for heavy hitters, 8 s for spells that matter, 0 for the rest)"`
+		RespondTo string   `json:"respond_to,omitempty" jsonschema:"the guid from a [play] line: you cast this in response to that player's spell (announced loudly, always with a window)"`
+		Counters  bool     `json:"counters,omitempty" jsonschema:"with respond_to: your spell counters theirs; once yours resolves, its owner gets Countered / Not countered buttons on their card"`
 	}
 	mcp.AddTool(s, &mcp.Tool{Name: "cast", Description: "Cast a spell in one call: tap the mana, announce it, put it on the stack, give the table a quiet window to respond " +
 		"(they drop a card on your board or say 'wait'), then resolve it onto your battlefield or into the graveyard. " +
-		"Returns 'resolved' (carry out its effect now if it has one) or the response, with the spell left on the stack for you to finish. Lands use play."},
+		"Returns 'resolved' (carry out its effect now if it has one) or the response, with the spell left on the stack for you to finish. Lands use play. " +
+		"In response to another player's spell, pass respond_to (and counters=true for a counterspell)."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in castIn) (*mcp.CallToolResult, any, error) {
+			var target *playInfo
+			if in.RespondTo != "" {
+				if target = knownPlay(in.RespondTo); target == nil {
+					target = &playInfo{name: "their spell", to: "battlefield"}
+				}
+				// your answer replaces the hold's "carry on"
+				_ = d.Pad.Call(ctx, "release", map[string]any{"quiet": true}, nil)
+			} else if in.Counters {
+				return nil, nil, errors.New("counters needs respond_to: the guid of the spell you counter")
+			}
+			paid := ""
 			if len(in.Tap) > 0 {
-				if err := d.Pad.Call(ctx, "tap", map[string]any{"guids": in.Tap}, nil); err != nil {
+				var tapped struct {
+					Sacrificed []string `json:"sacrificed"`
+				}
+				if err := d.Pad.Call(ctx, "tap", map[string]any{"guids": in.Tap, "mana": true}, &tapped); err != nil {
 					return nil, nil, err
 				}
-			}
-			// the card's text first (hand or command zone), to tell a quick
-			// spell from one that deserves a window
-			var desc string
-			if h, err := d.Pad.Hand(ctx); err == nil {
-				for _, rc := range h.Cards {
-					if rc.GUID == in.GUID {
-						desc = rc.Desc
-					}
+				if len(tapped.Sacrificed) > 0 {
+					paid = "\nSacrificed for mana: " + strings.Join(tapped.Sacrificed, ", ") + "."
 				}
 			}
 			var played struct {
 				Played string `json:"played"`
+				Desc   string `json:"desc"` // the card's text, to tell a quick spell from one that deserves a window
 				GUID   string `json:"guid"`
 				From   string `json:"from"`
 			}
 			if err := d.Pad.Call(ctx, "play", map[string]any{"guid": in.GUID, "row": "stack"}, &played); err != nil {
 				return nil, nil, err
 			}
-			c := cards.Parse(played.Played, desc)
+			c := cards.Parse(played.Played, played.Desc)
+			if nth, tax := commanderTax(played.GUID, played.From); tax > 0 {
+				paid += fmt.Sprintf("\nCommander tax: this is cast #%d from the command zone, so it costs {%d} more than printed. "+
+					"If the mana you tapped did not cover that, tap %d more sources now.", nth, tax, tax)
+			}
 			to := in.To
 			if to == "" {
 				switch {
@@ -598,33 +696,56 @@ func registerActions(s *mcp.Server, d Deps) {
 			if hold, _ := needsWindow(ctx, d, c, played.From); hold {
 				window = 8
 			}
+			// a board wipe or a huge threat: the players get a decision pad
+			// on their mat and longer to think (Wait pauses the countdown)
+			heavy, why := false, ""
+			if target == nil {
+				if heavy, why = heavyHitter(d.Docs, c); heavy {
+					window = 30
+				}
+			}
+			if target != nil {
+				window = 8 // they may answer your answer
+			}
 			if in.Window != nil && *in.Window >= 0 {
 				window = *in.Window
 			}
 			announce := "Casting " + c.Name
+			if target != nil {
+				announce = fmt.Sprintf("In response to %s's %s: %s", or(target.color, "that"), target.name, c.Name)
+			}
 			if in.Note != "" {
 				announce += ", " + in.Note
 			}
 			var asked struct {
-				Round int `json:"round"`
+				Round int  `json:"round"`
+				Pads  bool `json:"pads"`
 			}
 			var err error
 			if window > 0 {
-				err = d.Pad.Call(ctx, "ask", map[string]any{"text": announce, "kind": "responses", "wait": window, "quiet": true}, &asked)
+				ask := map[string]any{"text": announce, "kind": "responses", "wait": window, "quiet": true, "loud": target != nil}
+				if heavy {
+					ask["text"] = announce + ". Respond?"
+					ask["pads"] = true
+				}
+				err = d.Pad.Call(ctx, "ask", ask, &asked)
 			} else {
-				err = d.Pad.Call(ctx, "say", map[string]any{"text": announce}, nil)
+				err = d.Pad.Call(ctx, "say", map[string]any{"text": announce, "loud": target != nil}, nil)
 			}
 			var seen []Event
 			if err == nil && window > 0 {
 				var hit Event
-				hit, seen = Await(ctx, d, time.Duration(window+5)*time.Second, func(e Event) bool {
-					id, _ := e["id"].(float64)
-					return e.Str("ev") == "round" && int(id) == asked.Round
-				})
+				var paused bool
+				hit, seen, paused = awaitRound(ctx, d, asked.Round, time.Duration(window+5)*time.Second, 3*time.Minute)
+				if paused {
+					return text(fmt.Sprintf("HELD: a player pressed Wait on their decision pad and is still thinking about %s, which stays on the stack [%s]. "+
+						"wait_for_event for its [round] line: on 'respond' let them act, on all_no move it to %s yourself and carry out its effect.%s",
+						c.Name, played.GUID, to, meanwhile(seen)) + paid), nil, nil
+				}
 				if hit != nil && hit.Str("result") == "respond" {
 					return text(fmt.Sprintf("RESPONSE: %s\n%s is still on the stack [%s]. Answer it (cast an instant) or let their response resolve; "+
 						"then finish yours yourself: move it to the graveyard if it was countered, else to %s. Ask in one line if their intent is unclear.%s",
-						Render(hit), c.Name, played.GUID, to, meanwhile(seen))), nil, nil
+						Render(hit), c.Name, played.GUID, to, meanwhile(seen)) + paid), nil, nil
 				}
 			} else if err != nil && !strings.Contains(err.Error(), "nobody to ask") {
 				return nil, nil, err
@@ -637,26 +758,47 @@ func registerActions(s *mcp.Server, d Deps) {
 				return nil, nil, fmt.Errorf("%s resolved but could not be moved off the stack: %w", c.Name, err)
 			}
 			msg := fmt.Sprintf("%s resolved (no responses) -> %s.", c.Name, to)
+			if asked.Pads {
+				msg = fmt.Sprintf("%s resolved (no responses on the decision pads; %s) -> %s.", c.Name, why, to)
+			}
 			if window == 0 {
 				msg = fmt.Sprintf("%s resolved at once (a quick spell, no window) -> %s. If someone drops a counter on your board in the next few seconds, honour it.", c.Name, to)
 				noteQuietCast(c.Name, played.GUID, to)
 			}
+			if in.Counters {
+				return text(msg + " " + settleCounter(ctx, d, in.RespondTo, target) + meanwhile(seen) + paid), nil, nil
+			}
 			if to == "graveyard" || in.Note != "" {
-				msg += " Carry out its effect now and say what happened."
+				msg += " Carry out its effect now; say the result only if the table cannot see it, in a few words."
 			} else {
 				msg += " If it has an enters effect, carry it out now."
 			}
-			return text(msg + meanwhile(seen)), nil, nil
+			return text(msg + meanwhile(seen) + paid), nil, nil
+		})
+
+	mcp.AddTool(s, &mcp.Tool{Name: "pass", Description: "Let a spell the table is holding for you resolve: says 'no response, carry on' and lifts the hold at once (a hold also runs out by itself)."},
+		func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+			var out struct {
+				Released any    `json:"released"`
+				Name     string `json:"name"`
+			}
+			if err := d.Pad.Call(ctx, "release", map[string]any{}, &out); err != nil {
+				return nil, nil, err
+			}
+			if out.Name == "" {
+				return text("nothing was held (it ran out or you answered already); stay quiet"), nil, nil
+			}
+			return text("passed: " + out.Name + " resolves"), nil, nil
 		})
 
 	type attackIn struct {
 		GUIDs  []string `json:"guids" jsonschema:"attacking creatures (your battlefield)"`
 		Target string   `json:"target" jsonschema:"defending colour, or a planeswalker/battle name"`
 		Note   string   `json:"note,omitempty" jsonschema:"anything extra to announce (triggers, pump, etc.)"`
-		Wait   *int     `json:"wait,omitempty" jsonschema:"seconds to wait for the defender to declare blocks (default 20)"`
+		Wait   *int     `json:"wait,omitempty" jsonschema:"seconds to wait for the defender to declare blocks (default 45; humans need time to work out blocks)"`
 	}
 	mcp.AddTool(s, &mcp.Tool{Name: "attack", Description: "Declare attackers: taps them, announces the attack loudly and waits for the defender's blocks in chat (silence = no blocks). " +
-		"Returns what they said; then work out damage, say the numbers and let them move their tracker."},
+		"Returns what they said; then work out damage, say the numbers in one line and let them move their tracker."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in attackIn) (*mcp.CallToolResult, any, error) {
 			var tapped struct {
 				Tapped []string `json:"tapped"`
@@ -675,7 +817,7 @@ func registerActions(s *mcp.Server, d Deps) {
 			if err := d.Pad.Call(ctx, "say", map[string]any{"text": msg + " Blocks?", "loud": true}, nil); err != nil {
 				return nil, nil, err
 			}
-			wait := 20
+			wait := 45
 			if in.Wait != nil && *in.Wait >= 0 {
 				wait = *in.Wait
 			}
@@ -694,10 +836,153 @@ func registerActions(s *mcp.Server, d Deps) {
 		})
 }
 
+// settleCounter puts the Countered / Not countered buttons on the countered
+// card and waits for its owner. A spell that went to the graveyard already
+// did its thing at the table, so its owner is asked to undo it instead.
+func settleCounter(ctx context.Context, d Deps, guid string, t *playInfo) string {
+	if t.to == "graveyard" {
+		msg := fmt.Sprintf("%s is countered. %s: please undo it", t.name, or(t.color, "Everyone"))
+		_ = d.Pad.Call(ctx, "say", map[string]any{"text": msg, "loud": true}, nil)
+		return t.name + " is countered: it is already in the graveyard, so you asked its owner to undo its effect."
+	}
+	var out struct {
+		Owner  string `json:"owner"`
+		InHand bool   `json:"inHand"`
+	}
+	if err := d.Pad.Call(ctx, "countered", map[string]any{"guid": guid}, &out); err != nil {
+		return fmt.Sprintf("%s is countered, but the buttons failed (%v): ask its owner in chat to put it in their graveyard.", t.name, err)
+	}
+	if out.InHand {
+		msg := fmt.Sprintf("%s: %s is countered, so graveyard rather than hand please", or(t.color, "Owner"), t.name)
+		_ = d.Pad.Call(ctx, "say", map[string]any{"text": msg}, nil)
+		return t.name + " is countered, but its owner already picked it back up into their hand; you asked them to put it in their graveyard."
+	}
+	hit, seen := Await(ctx, d, 30*time.Second, func(e Event) bool {
+		return e.Str("ev") == "countered" && e.Str("guid") == guid
+	})
+	if hit == nil {
+		return fmt.Sprintf("%s is countered; %s has Countered / Not countered buttons on it and has not pressed one yet (a [countered] event will say).",
+			t.name, out.Owner) + meanwhile(seen)
+	}
+	return Render(hit) + meanwhile(seen)
+}
+
 func isColour(s string) bool {
 	switch s {
 	case "White", "Brown", "Red", "Orange", "Yellow", "Green", "Teal", "Blue", "Purple", "Pink":
 		return true
 	}
 	return false
+}
+
+// sleepCtx waits for dur (nothing when it is 0 or less) unless ctx ends first.
+func sleepCtx(ctx context.Context, dur time.Duration) error {
+	if dur <= 0 {
+		return nil
+	}
+	select {
+	case <-time.After(dur):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// dealt waits until your hand holds want cards: deal() animates, and the hand
+// zone only owns a card once it lands (about a second). It gives up after
+// 3 s and returns what the hand holds by then.
+func dealt(ctx context.Context, d Deps, want int) (*pad.HandReply, error) {
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if err := sleepCtx(ctx, 250*time.Millisecond); err != nil {
+			return nil, err
+		}
+		h, err := d.Pad.Hand(ctx)
+		if err != nil || len(h.Cards) >= want || time.Now().After(deadline) {
+			return h, err
+		}
+	}
+}
+
+// renderHand lists a hand with full card text.
+func renderHand(b *strings.Builder, h *pad.HandReply) {
+	fmt.Fprintf(b, "Hand of %s (%d cards)\n", h.Seat, len(h.Cards))
+	for _, rc := range h.Cards {
+		b.WriteString(renderCard(rc.Parse(), rc.Zone))
+	}
+}
+
+// announce says text in chat before an action ("" says nothing).
+func announce(ctx context.Context, d Deps, text string) error {
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	return d.Pad.Call(ctx, "say", map[string]any{"text": text}, nil)
+}
+
+// tokenCards remembers each token query's card for the session: Treasure and
+// Goblin come up again and again, and each lookup is a Scryfall search plus
+// an importer build.
+var tokenCards = struct {
+	sync.Mutex
+	m map[string][2]string // query -> card JSON, nickname
+}{m: map[string][2]string{}}
+
+// tokenQuery turns a plain name ("Treasure") into an exact-name search: Scryfall
+// ranks a bare word by full-text relevance, and "Treasure" once returned a
+// Dinosaur token whose text mentions Treasure.
+func tokenQuery(q string) string {
+	q = strings.TrimSpace(q)
+	if q == "" || strings.ContainsAny(q, `!:=<>"`) || strings.Contains(q, " -") || strings.HasPrefix(q, "-") {
+		return q
+	}
+	return `!"` + q + `" -is:dfc`
+}
+
+// markLanded marks a card the pad just spawned. It counts as yours only once
+// it has landed on your mat, so the first calls can fail: retry briefly.
+func markLanded(ctx context.Context, d Deps, args map[string]any, out any) error {
+	var err error
+	for try := 0; try < 8; try++ {
+		if err = sleepCtx(ctx, 300*time.Millisecond); err != nil {
+			return err
+		}
+		if err = d.Pad.Call(ctx, "mark", args, out); err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
+func tokenCard(ctx context.Context, d Deps, query string) (json.RawMessage, string, error) {
+	tokenCards.Lock()
+	hit, ok := tokenCards.m[query]
+	tokenCards.Unlock()
+	if ok {
+		return json.RawMessage(hit[0]), hit[1], nil
+	}
+	found, err := d.Scryfall.Search(ctx, "t:token "+tokenQuery(query), "")
+	if err != nil {
+		return nil, "", err
+	}
+	if len(found) == 0 {
+		return nil, "", fmt.Errorf("no token matched %q on Scryfall", query)
+	}
+	tok := found[0]
+	line := fmt.Sprintf("1 %s (%s) %s", tok.Name, strings.ToUpper(tok.Set), tok.CollectorNumber)
+	piles, issues, err := d.Importer.Build(ctx, line)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(piles) == 0 {
+		return nil, "", fmt.Errorf("the importer could not build %q (%s)", line, strings.Join(issues, "; "))
+	}
+	card, nick, err := importer.FirstCard(piles[0])
+	if err != nil {
+		return nil, "", err
+	}
+	tokenCards.Lock()
+	tokenCards.m[query] = [2]string{string(card), nick}
+	tokenCards.Unlock()
+	return card, nick, nil
 }

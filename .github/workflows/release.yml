@@ -26,7 +26,7 @@ jobs:
               GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -trimpath \
                 -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "$dir/$cmd$ext" ./cmd/$cmd
             done
-            cp dist/Nemesis.json README.md LICENSE PLAYBOOK.md RULES.md "$dir/"
+            cp dist/Nemesis.json README.md LICENSE PLAYBOOK.md RULES.md DRAFT.md HEAVY_HITTERS.md "$dir/"
             cp -r docs "$dir/"
             zip -qr "$dir.zip" "$dir"
           done

@@ -51,7 +51,8 @@ func RegisterFlags(fs *flag.FlagSet) *Options {
 const Instructions = `Nemesis seats you as a player at a Tabletop Simulator Magic: The Gathering Commander table, named %s. ` +
 	`Before the first game call playbook (how to play here) and mode_rules (the table's play mode), unless your client already loaded PLAYBOOK.md. ` +
 	`You only ever see your own hand. Announce with say before acting, never touch other players' objects or life trackers without their yes, ` +
-	`and loop on wait_for_event (45 s calls are fine, nothing is lost between them) during other players' turns.`
+	`and loop on wait_for_event (45 s calls are fine, nothing is lost between them) during other players' turns. ` +
+	`If the table wants to draft, read playbook(part=draft) first.`
 
 // Runtime is a running Nemesis server and what it is built from.
 type Runtime struct {

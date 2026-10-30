@@ -26,12 +26,13 @@ var sections = []struct {
 	tools []string
 }{
 	{"Reading the table", []string{"table_state", "my_hand", "wait_for_event", "parse_card", "tts_log"}},
-	{"Talking to the table", []string{"say", "ask_table", "cancel_round", "player_pads", "claim_seat"}},
+	{"Talking to the table", []string{"say", "ask_table", "cancel_round", "claim_seat", "table_layout"}},
 	{"Playbook, modes and decks", []string{"playbook", "list_modes", "mode_rules", "list_decks", "deck_info", "import_deck"}},
 	{"Your cards", []string{"begin_turn", "cast", "draw", "mulligan", "shuffle_library", "play", "tap", "untap", "flip", "move", "attack", "end_turn"}},
 	{"Library effects", []string{"look", "search_library", "reveal_until", "reveal"}},
 	{"Counters, tokens and life", []string{"mark", "counter", "spawn_token", "adjust_life", "reset_life", "commander_damage"}},
 	{"Setting up and between games", []string{"setup_pad", "reset_board"}},
+	{"Drafting", []string{"start_draft", "draft_view", "draft_pick", "draft_build", "cancel_draft"}},
 	{"Development only (-dev)", []string{"exec_lua"}},
 }
 

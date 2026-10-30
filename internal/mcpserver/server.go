@@ -4,6 +4,7 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -33,17 +34,21 @@ type Deps struct {
 	Dev      bool
 }
 
+// chatLineMax is about one line of TTS chat at the default size. TTS keeps
+// no chat history, so longer lines push the table's own news off screen.
+const chatLineMax = 100
+
 func text(s string) *mcp.CallToolResult {
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: s}}}
 }
 
 // Register adds every tool to s.
 func Register(s *mcp.Server, d Deps) {
+	watchPlays(d)
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "table_state",
-		Description: "Everything public about the Commander table: each seat's player, life, commander damage taken, " +
-			"hand COUNT, library COUNT, graveyard/exile/command zone cards, and battlefield (name, tapped, face-down, land row, counter tiles resting on the card, and the on-card state players set with right-click: +1/+1 counters, loyalty, keywords, notes, phased out, token). " +
-			"Your own seat is flagged. Opponents' hands and all libraries are never listed - that is by design.",
+		Description: "Everything public at the table: per seat life, commander damage, hand and library COUNTS, graveyard, exile, command zone, " +
+			"and battlefield with tapped, face-down, counter tiles and on-card state. Other hands and all libraries are never listed, by design.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
 		// name and modes for the pad; an old pad without configure still plays
 		note := ""
@@ -68,11 +73,7 @@ func Register(s *mcp.Server, d Deps) {
 			return nil, nil, err
 		}
 		var b strings.Builder
-		fmt.Fprintf(&b, "Hand of %s (%d cards)\n", h.Seat, len(h.Cards))
-		for _, rc := range h.Cards {
-			c := rc.Parse()
-			b.WriteString(renderCard(c, rc.Zone))
-		}
+		renderHand(&b, h)
 		return text(b.String()), nil, nil
 	})
 
@@ -83,37 +84,42 @@ func Register(s *mcp.Server, d Deps) {
 	}
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "say",
-		Description: "Speak in TTS chat as yourself. Announce intent BEFORE acting, answer questions, call out life changes. With to=<colour>, whisper privately to that seat (secret choices).",
+		Description: "Speak in TTS chat as yourself: one short line (TTS keeps no chat history, long lines scroll away). Announce intent before acting, answer questions. With to=<colour>, whisper to that seat only (secret choices).",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in sayIn) (*mcp.CallToolResult, any, error) {
 		if err := d.Pad.Call(ctx, "say", map[string]any{"text": in.Text, "loud": in.Loud, "to": in.To}, nil); err != nil {
 			return nil, nil, err
 		}
-		if in.To != "" {
-			return text("whispered to " + in.To + ": " + in.Text), nil, nil
+		long := ""
+		if n := len([]rune(in.Text)); n > chatLineMax {
+			long = fmt.Sprintf(" (%d characters: too long for TTS chat, keep lines under %d)", n, chatLineMax)
 		}
-		return text("said: " + in.Text), nil, nil
+		if in.To != "" {
+			return text("whispered to " + in.To + long), nil, nil
+		}
+		return text("said" + long), nil, nil
 	})
 
 	type askIn struct {
 		Text  string   `json:"text" jsonschema:"the question, e.g. 'Casting Craterhoof Behemoth, any responses?' or 'Want me to apply agreed damage to your tracker?'"`
 		Kind  string   `json:"kind,omitempty" jsonschema:"responses (default) or yesno"`
 		Seats []string `json:"seats,omitempty" jsonschema:"colours to ask (default: every seated human)"`
-		Wait  *int     `json:"wait,omitempty" jsonschema:"seconds of silence that settle it (default: the pad's setting, 15; 0 waits for every answer)"`
+		Wait  *int     `json:"wait,omitempty" jsonschema:"seconds of silence that settle it (default: the pad's setting, 15, or 30 for yesno and pads; 0 waits for every answer)"`
+		Pads  bool     `json:"pads,omitempty" jsonschema:"a heavy decision: put a Yes / No / Wait pad with a countdown on each asked seat's mat (if the table has decision pads on). Only for decisions that really matter"`
 	}
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "ask_table",
-		Description: "Ask the table loudly and WAIT for the answer: one per seat, from chat ('no', 'go' pass; 'wait', 'hold' respond; 'yes'/'no'), a card dropped on your board, or optional player pads. " +
+		Description: "Ask the table loudly and WAIT for the answer: one per seat, from chat ('no', 'go' pass; 'wait', 'hold' respond; 'yes'/'no'), a card dropped on your board, or a decision pad (pads=true). " +
 			"Silence for the wait settles it. Returns all_no (go on), respond by <colour> (stop, let them act; it names the card if they dropped one), or answered/timeout with answers like 'Blue=yes, White=no'. " +
 			"For your own spells use cast, which has its own quiet window; ask only for triggers and real questions.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in askIn) (*mcp.CallToolResult, any, error) {
 		var out struct {
-			Round      int      `json:"round"`
-			Kind       string   `json:"kind"`
-			Asked      []string `json:"asked"`
-			PlayerPads int      `json:"playerPads"`
-			Wait       int      `json:"wait"`
+			Round int      `json:"round"`
+			Kind  string   `json:"kind"`
+			Asked []string `json:"asked"`
+			Pads  bool     `json:"pads"`
+			Wait  int      `json:"wait"`
 		}
-		params := map[string]any{"text": in.Text, "kind": in.Kind}
+		params := map[string]any{"text": in.Text, "kind": in.Kind, "pads": in.Pads}
 		if len(in.Seats) > 0 {
 			params["seats"] = in.Seats
 		}
@@ -129,13 +135,14 @@ func Register(s *mcp.Server, d Deps) {
 		if out.Wait > 0 && time.Duration(out.Wait+5)*time.Second < limit {
 			limit = time.Duration(out.Wait+5) * time.Second
 		}
-		hit, seen := Await(ctx, d, limit, func(e Event) bool {
-			id, _ := e["id"].(float64)
-			return e.Str("ev") == "round" && int(id) == out.Round
-		})
+		hit, seen, paused := awaitRound(ctx, d, out.Round, limit, limit)
 		if hit == nil {
-			return text(fmt.Sprintf("round #%d asked %s: no answer yet after %s, still open (ask again to remind them, or cancel_round)%s",
-				out.Round, strings.Join(out.Asked, ", "), limit, meanwhile(seen))), nil, nil
+			why := "no answer yet"
+			if paused {
+				why = "a player pressed Wait on their pad"
+			}
+			return text(fmt.Sprintf("round #%d asked %s: %s after %s, still open (wait_for_event for the [round] line, or cancel_round)%s",
+				out.Round, strings.Join(out.Asked, ", "), why, limit, meanwhile(seen))), nil, nil
 		}
 		return text(Render(hit) + meanwhile(seen)), nil, nil
 	})
@@ -144,25 +151,33 @@ func Register(s *mcp.Server, d Deps) {
 		Name:        "cancel_round",
 		Description: "Close the open ask_table round without a result (the question no longer matters, or players answered in chat).",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
-		var out map[string]any
+		var out struct {
+			Cancelled bool `json:"cancelled"`
+			ID        int  `json:"id"`
+		}
 		if err := d.Pad.Call(ctx, "cancel_round", nil, &out); err != nil {
 			return nil, nil, err
 		}
-		return text(fmt.Sprint(out)), nil, nil
+		if !out.Cancelled {
+			return text("no round was open"), nil, nil
+		}
+		return text(fmt.Sprintf("round #%d cancelled", out.ID)), nil, nil
 	})
 
-	type padsIn struct {
-		Remove bool `json:"remove,omitempty" jsonschema:"true removes every player pad instead"`
-	}
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "player_pads",
-		Description: "Optional: place a small Yes / No / Respond pad above each seated human's mat, or remove them all. Chat answers work without them; only on request.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in padsIn) (*mcp.CallToolResult, any, error) {
-		var out map[string]any
-		if err := d.Pad.Call(ctx, "player_pads", map[string]any{"remove": in.Remove}, &out); err != nil {
+		Name: "table_layout",
+		Description: "Diagnostic: where things sit around your seat in mat terms (along = the mat's forward axis, right = its right axis, from its centre): " +
+			"every non-card object within reach with its name, scale, script functions and buttons, the cards there, your life tracker and the Winston spots. For fitting the pad to a table; not for play.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+		var out json.RawMessage
+		if err := d.Pad.Call(ctx, "layout", nil, &out); err != nil {
 			return nil, nil, err
 		}
-		return text(fmt.Sprint(out)), nil, nil
+		var buf bytes.Buffer
+		if err := json.Indent(&buf, out, "", " "); err != nil {
+			return text(string(out)), nil, nil
+		}
+		return text(buf.String()), nil, nil
 	})
 
 	type claimIn struct {
@@ -183,9 +198,8 @@ func Register(s *mcp.Server, d Deps) {
 	}
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "wait_for_event",
-		Description: "Block until something happens at the table, then return every event so far, one line each: [chat], [play] (another player cast or played a card, with its text and whether you could respond), " +
-			"[round] (your ask_table settled), [turn], [button] (admin pad: your_turn/undo/stop/resume/yes/no; player pads), [zone] (your cards moved), [log] (life and commander damage lines), [mode], [new_player], [seat], [import]. " +
-			"Use this during other players' turns instead of polling.",
+		Description: "Block until something happens at the table, then return the events, one line each ([chat], [play], [attack], [turn], [round], [hold], [countered], [button], [zone], [log]...). " +
+			"Land drops and other players' turn changes do not wake you; they come summed up with the next event. Use this during other players' turns instead of polling.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in waitIn) (*mcp.CallToolResult, any, error) {
 		to := in.TimeoutSeconds
 		if to <= 0 {
@@ -194,12 +208,37 @@ func Register(s *mcp.Server, d Deps) {
 		if to > 600 {
 			to = 600
 		}
-		note, evs := NextEvents(ctx, d, time.Duration(to)*time.Second)
-		var b strings.Builder
-		if note != "" {
-			b.WriteString(note + "\n")
+		// every wake is a whole model turn: land drops and other players'
+		// turn changes wait for something that needs you, then come along
+		// as one summary line
+		deadline := time.Now().Add(time.Duration(to) * time.Second)
+		var notes []string
+		var minor, evs []Event
+		for len(evs) == 0 && ctx.Err() == nil {
+			left := time.Until(deadline)
+			if left <= 0 {
+				break
+			}
+			note, got := NextEvents(ctx, d, left)
+			if note != "" {
+				notes = append(notes, note)
+			}
+			for _, e := range got {
+				if minorEvent(e) {
+					minor = append(minor, e)
+				} else {
+					evs = append(evs, e)
+				}
+			}
 		}
-		if len(evs) == 0 {
+		var b strings.Builder
+		for _, n := range notes {
+			b.WriteString(n + "\n")
+		}
+		if len(minor) > 0 {
+			b.WriteString(summarise(minor) + "\n")
+		}
+		if len(evs) == 0 && len(minor) == 0 {
 			b.WriteString("no events in " + fmt.Sprint(to) + "s")
 		}
 		for _, e := range evs {
@@ -256,6 +295,7 @@ func Register(s *mcp.Server, d Deps) {
 	})
 
 	registerActions(s, d)
+	registerDraft(s, d)
 	registerContent(s, d)
 	registerSetup(s, d)
 
@@ -277,8 +317,8 @@ func Register(s *mcp.Server, d Deps) {
 }
 
 // collectEvents waits up to timeout for the first event, then drains
-// whatever else arrived within a short settle window.
-func collectEvents(ctx context.Context, c *ttsapi.Client, timeout time.Duration) []json.RawMessage {
+// whatever else arrived within the settle window (0: only what is queued).
+func collectEvents(ctx context.Context, c *ttsapi.Client, timeout, settle time.Duration) []json.RawMessage {
 	var out []json.RawMessage
 	first := time.NewTimer(timeout)
 	defer first.Stop()
@@ -290,12 +330,23 @@ func collectEvents(ctx context.Context, c *ttsapi.Client, timeout time.Duration)
 	case <-ctx.Done():
 		return nil
 	}
-	settle := time.After(300 * time.Millisecond)
+	quiet := time.After(settle)
 	for {
 		select {
 		case e := <-c.Events:
 			out = append(out, e)
-		case <-settle:
+		case <-quiet:
+			if settle == 0 {
+				// still take what is already queued
+				for {
+					select {
+					case e := <-c.Events:
+						out = append(out, e)
+					default:
+						return out
+					}
+				}
+			}
 			return out
 		}
 	}
@@ -366,8 +417,12 @@ func renderSnapshot(s *pad.Snapshot) string {
 		fmt.Fprintf(&b, "Pending request on pad: %s\n", s.Pad.Pending)
 	}
 	if s.Pad.ModeName != "" {
-		fmt.Fprintf(&b, "Play mode: %s (mode_rules). New players: %s. Player pads on the table: %d\n",
-			s.Pad.ModeName, or(strings.Join(s.Pad.NewPlayers, ", "), "none"), s.Pad.PlayerPads)
+		pads := "off"
+		if s.Pad.DecisionPads {
+			pads = "on"
+		}
+		fmt.Fprintf(&b, "Play mode: %s (mode_rules). New players: %s. Decision pads: %s\n",
+			s.Pad.ModeName, or(strings.Join(s.Pad.NewPlayers, ", "), "none"), pads)
 	}
 	if r := s.Pad.Round; r != nil {
 		fmt.Fprintf(&b, "Open %s round #%d %q: waiting on %s\n", r.Kind, r.ID, r.Text, or(strings.Join(r.WaitingOn, ", "), "nobody"))
@@ -621,13 +676,6 @@ func names(cs []pad.RawCard) string {
 		out = append(out, n)
 	}
 	return strings.Join(out, ", ")
-}
-
-func onoff(b bool) string {
-	if b {
-		return "on"
-	}
-	return "off"
 }
 
 func or(s, def string) string {
